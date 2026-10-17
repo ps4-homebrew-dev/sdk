@@ -20,7 +20,7 @@ PYTHON ?= python3
 DESTDIR ?= /opt/ps4-homebrew-sdk
 
 LLVM_CONFIG_CANDIDATES := llvm-config-23 llvm-config-22 llvm-config-21 \
-                          llvm-config
+                          llvm-config-20 llvm-config
 LLVM_CONFIG_CANDIDATES := $(strip $(foreach LCC,$(LLVM_CONFIG_CANDIDATES), \
                           $(if $(shell command -v $(LCC) 2>/dev/null),$(LCC))))
 
