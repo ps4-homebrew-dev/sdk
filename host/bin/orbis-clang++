@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+#   Copyright (C) 2026 John Törnblom
+#
+# This file is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; see the file COPYING. If not see
+# <http://www.gnu.org/licenses/>.
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_NAME="$(basename "${SCRIPT_PATH}")"
+SCRIPT_DIR="$(dirname "${SCRIPT_PATH}")"
+
+LLVM_BINDIR=$("${SCRIPT_DIR}/orbis-llvm-config" --bindir)
+BIN_PATH="${LLVM_BINDIR}/clang++"
+LIBS_CRT="${SCRIPT_DIR}/../target/lib/crt1.o"
+NO_CRT=0
+
+TU=""
+LIBS_C="-lc"
+LIBS_CXX="-lc++ -lc++abi -lunwind"
+LIBS_DEPS="-lkernel -lSceLibcInternal -lSceSysmodule -lSceNet"
+
+for ARG in "$@"; do
+    if [[ "$ARG" == "-nostdlib" ||
+          "$ARG" == "-nodefaultlibs" ]]; then
+	LIBS_C=""
+	LIBS_CXX=""
+	LIBS_DEPS=""
+    fi
+    if [[ "$ARG" == "-nostdlib++" ]]; then
+	LIBS_CXX=""
+    fi
+    if [[ "$ARG" == "-shared" && ${NO_CRT} -eq 0 ]]; then
+	LIBS_CRT="${SCRIPT_DIR}/../target/lib/crtbeginS.o"
+    fi
+    if [[ "$ARG" == "-nostartfiles" ||
+          "$ARG" == "-nostdlib" ||
+          "$ARG" == "-c" ||
+          "$ARG" == "-S" ||
+          "$ARG" == "-E" ||
+          "$ARG" == "-r" ]]; then
+	LIBS_CRT=""
+	NO_CRT=1
+    fi
+    if [[ ! "${ARG:0:1}" == "-" ]]; then
+	TU="${ARG}"
+    fi
+done
+
+# no translation unit provided
+if [[ "${TU}" == "" ]]; then
+    LIBS_C=""
+    LIBS_CXX=""
+    LIBS_DEPS=""
+fi
+
+# ensure clang knows where orbis-ld is at
+export PATH="${SCRIPT_DIR}:${PATH}"
+
+exec -a "${SCRIPT_NAME}" "${BIN_PATH}" \
+     --config "${SCRIPT_DIR}/../toolchain/orbis-clang++.cfg" \
+     --start-no-unused-arguments $LIBS_CXX $LIBS_C --end-no-unused-arguments \
+     "$@" \
+     --start-no-unused-arguments $LIBS_CRT $LIBS_DEPS --end-no-unused-arguments

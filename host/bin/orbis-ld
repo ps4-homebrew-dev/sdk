@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+#   Copyright (C) 2026 John Törnblom
+#
+# This file is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; see the file COPYING. If not see
+# <http://www.gnu.org/licenses/>.
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(dirname "${SCRIPT_PATH}")"
+
+LLVM_BINDIR=$("${SCRIPT_DIR}/orbis-llvm-config" --bindir)
+LDSCRIPT_DIR="${SCRIPT_DIR}/../target/lib"
+
+# clang passes (almost) nothing PlayStation specific to the PS4 linker: Sony's
+# orbis-ld knows the layout the PS4 loader expects by itself.  ld.lld does
+# not, so those options are added here, together with the linker script that
+# orbis-elf2self expects.
+RELOCATABLE=0
+SHARED=0
+STATIC=0
+PIE=1
+SCRIPT=0
+
+for ARG in "$@"; do
+    case "${ARG}" in
+	-r|--relocatable)
+	    RELOCATABLE=1;;
+	-shared|--shared|-Bshareable)
+	    SHARED=1;;
+	-static|--static)
+	    STATIC=1;;
+	-no-pie|--no-pie|-nopie)
+	    PIE=0;;
+	-T|-T*|--script|--script=*|-dT|--default-script|--default-script=*)
+	    SCRIPT=1;;
+    esac
+done
+
+if [[ ${RELOCATABLE} -eq 1 ]]; then
+    exec "${LLVM_BINDIR}/ld.lld" "$@"
+fi
+
+FLAGS=(-m elf_x86_64_fbsd
+       --eh-frame-hdr
+       --hash-style=sysv
+       --unresolved-symbols=report-all
+       -z now
+       -z start-stop-visibility=hidden
+       -z rodynamic
+       -z common-page-size=0x4000
+       -z max-page-size=0x4000)
+
+if [[ ${SHARED} -eq 0 && ${STATIC} -eq 0 && ${PIE} -eq 1 ]]; then
+    FLAGS+=(-pie)
+fi
+
+if [[ ${SCRIPT} -eq 0 ]]; then
+    if [[ ${SHARED} -eq 1 ]]; then
+	FLAGS+=(--default-script "${LDSCRIPT_DIR}/prx.script")
+    else
+	FLAGS+=(--default-script "${LDSCRIPT_DIR}/main.script")
+    fi
+fi
+
+exec "${LLVM_BINDIR}/ld.lld" "${FLAGS[@]}" "$@"

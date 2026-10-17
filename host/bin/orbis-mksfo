@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 John Törnblom
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3, or (at your option) any
+# later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; see the file COPYING. If not, see
+# <http://www.gnu.org/licenses/>.
+'''
+Create a PS4 param.sfo file from KEY=VALUE pairs.
+'''
+
+import argparse
+import re
+import struct
+import sys
+from typing import BinaryIO, NamedTuple
+
+SFO_MAGIC = 0x46535000
+SFO_VERSION = 0x0101
+
+TYPE_BIN = 0
+TYPE_STR = 2
+TYPE_INT = 4
+
+# Packed little-endian layouts mirroring sfo_header_t and sfo_entry_t.
+HEADER = struct.Struct("<IIIII")  # magic, version, keys_offset, data_offset, count
+ENTRY = struct.Struct("<HBBIII")  # key_offset, alignment, type, val_length, val_size, val_offset
+
+
+class Value(NamedTuple):
+    type: int
+    data: bytes   # padded payload, len(data) == val_size
+    length: int   # val_length
+
+
+def int_value(text: str) -> Value:
+    """Encode an integer as a 32-bit little-endian SFO value."""
+    num = int(text, 0)  # accepts 123, 0x7b, 0o173, ...
+    if not -2**31 <= num < 2**32:
+        raise ValueError(f"{text} does not fit in 32 bits")
+    data = (num & 0xFFFFFFFF).to_bytes(4, "little")
+    return Value(TYPE_INT, data, 4)
+
+
+def str_value(text: str, size: int) -> Value:
+    """Encode a NUL-terminated UTF-8 string in a field of `size` bytes."""
+    raw = text.encode("utf-8")[:size - 1]
+    return Value(TYPE_STR, raw.ljust(size, b"\0"), len(raw) + 1)
+
+
+def split_pair(pair: str) -> tuple[str, str]:
+    key, sep, val = pair.partition("=")
+    if not sep:
+        raise ValueError(f"expected KEY=VALUE, got {pair!r}")
+    return key, val
+
+
+def build_sfo(params: dict[str, Value]) -> bytes:
+    """Serialize params into an SFO image, with entries sorted by key."""
+    entries, keys, data = [], bytearray(), bytearray()
+
+    for key in sorted(params, key=lambda k: k.encode("utf-8")):  # strcmp order
+        val = params[key]
+        entries.append(ENTRY.pack(len(keys), 4, val.type,
+                                  val.length, len(val.data), len(data)))
+        keys += key.encode("utf-8") + b"\0"
+        data += val.data
+
+    keys_offset = HEADER.size + ENTRY.size * len(entries)
+    data_offset = keys_offset + len(keys)
+    header = HEADER.pack(SFO_MAGIC, SFO_VERSION,
+                         keys_offset, data_offset, len(entries))
+
+    return b"".join([header, *entries, keys, data])
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        usage="%(prog)s [-i KEY=VALUE] [-s<SIZE> KEY=VALUE]... [param.sfo]",
+        description="Create a param.sfo file. Writes to stdout if no "
+                    "filename is given.")
+    parser.add_argument("-i", dest="ints", metavar="KEY=VALUE",
+                        action="append", default=[],
+                        help="add a 32-bit integer entry")
+    parser.add_argument("-s", dest="strs", metavar=("SIZE", "KEY=VALUE"),
+                        nargs=2, action="append", default=[],
+                        help="add a string entry occupying SIZE bytes")
+    parser.add_argument("filename", nargs="?",
+                        help="output file (default: stdout)")
+
+    # Accept the original "-s128 KEY=VALUE" form by splitting it into "-s 128".
+    argv = [part for arg in argv
+            for part in (re.fullmatch(r"-s(\d+)", arg) and ["-s", arg[2:]] or [arg])]
+    args = parser.parse_args(argv)
+
+    params: dict[str, Value] = {}
+    try:
+        for pair in args.ints:
+            key, val = split_pair(pair)
+            params[key] = int_value(val)
+    except ValueError as e:
+        parser.error(f"malformed integer key-value pair: {e}")
+
+    try:
+        for size, pair in args.strs:
+            if not size.isdigit() or int(size) < 1:
+                raise ValueError(f"invalid size {size!r}")
+            key, val = split_pair(pair)
+            params[key] = str_value(val, int(size))
+    except ValueError as e:
+        parser.error(f"malformed string key-value pair: {e}")
+
+    args.params = params
+    return args
+
+
+def write_sfo(params: dict[str, Value], fp: BinaryIO) -> None:
+    fp.write(build_sfo(params))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+
+    if args.filename is None:
+        write_sfo(args.params, sys.stdout.buffer)
+        return 0
+
+    try:
+        with open(args.filename, "wb") as fp:
+            write_sfo(args.params, fp)
+    except OSError as e:
+        print(f"{args.filename}: {e.strerror}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,2096 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 John Törnblom
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3, or (at your option) any
+# later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; see the file COPYING. If not, see
+# <http://www.gnu.org/licenses/>.
+#
+# The PKG and PFS layouts, and the (publicly known) fake keys below, follow
+# LibOrbisPkg by Maxton and the OpenOrbis contributors (LGPL-3.0-or-later,
+# https://github.com/OpenOrbis/LibOrbisPkg), so that for the same GP4
+# project this tool writes the same bytes as `PkgTool.Core pkg_build`.
+'''
+Create a PS4 fake PKG from a GP4 project.
+'''
+
+import argparse
+import hashlib
+import hmac
+import os
+import re
+import struct
+import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except ImportError:  # pragma: no cover - exercised by --pure-python
+    Cipher = None
+
+
+BLOCK_SIZE = 0x10000     # PFS block size
+XTS_SECTOR_SIZE = 0x1000  # PFS encryption sector size
+PLAYGO_CHUNK_SIZE = 0x10000
+
+
+###############################################################################
+# Keys
+###############################################################################
+
+RIF_DEBUG_KEY = bytes.fromhex(
+    "96c2268d69261c8b1e3b6bff2fe04e12"
+)
+
+KEYSTONE_HMAC_KEY = bytes.fromhex(
+    "c74405f67424ba342bc1276251bbc2f555f16025b6a1b6714780dbaec852fa2f"
+)
+
+KEYSTONE_MAC_DATA = bytes.fromhex(
+    "783d6f3ae91c0e0712fcaab7950bde06855cf7a22dcdbde127e9bfcbad0ff0fe"
+)
+
+FAKE_KEYSET_MODULUS = bytes.fromhex(
+    "c6cf71e7e59af0d12a2c458bf92a0ec143058bc37117801dcd497dde359d259b"
+    "a0d7a0f27d6c087eaa5502682b23c644b84418eb56cf16a24803c9e74f87eb3d"
+    "30c31588bf20e79dff770cde1d241e63a94f8abf5bbe601968333bfced9f474e"
+    "5ff8eacb3d00bd6701f92c6dc6ac1364e76714f3dc52696ab9832c4230131bb2"
+    "d8a5020d79ed96b10df8cc0cdf81954f035809570e80692efeff5277ea7528a8"
+    "fbc9bebf9fbbb7798e1805e180bd50349481d353c269a2d24ccf6cf4572c104a"
+    "3ffb22fd8b97e2c95ba62bcdd61b6bdb687f4bc2a05034c005e58def2467ff93"
+    "40cf2d62a2a050b1f13aa83dfd80d1f9b80522afc8354590588ee33a7cbd3e27"
+)
+
+DEBUG_RIF_MODULUS = bytes.fromhex(
+    "c2d244bcdd843fd9c522aff7fc888a3380ed8ee2cc81f7ecf81c79bf02bb128e"
+    "6168291b15b65ec6f8bf5ae03b6a6cd9d6f575aba06f3481349a5baded31e3c6"
+    "ea1ad11322bbb3dab3b253bd457987ad0a017218102949f4417fd6470c72929e"
+    "e9bb95a95d79ebe4307690454b9d9ccf9203608c4b6cb37a3a0539a066a935cf"
+    "b9faad9cabebe46a8ce93bcc72126263bd80c4ee372b3203a309f7a06157ad0d"
+    "cf15989e4e49f8b5a35c27ee4504eae44bbc8f87ed191e467563c45bd5bc092f"
+    "0273193c585549664c11ec0f09faa5560a5a6356ada00d8608c1e6b61322492f"
+    "7cdb4c56970ec2d92e87bc0e67c01b58bc642bc26ee2932eb56b70a4429f64c1"
+)
+
+DEBUG_RIF_PRIVATE_EXPONENT = bytes.fromhex(
+    "0161add89c0689d060c841f0b383015de3a26ba2ba9a0a58cd1aa09764ecd031"
+    "1fca360e69dd40f74ec0c6a373f06984b2f44b29142a6db823d81b61d49e87b3"
+    "bba9c4854af8034abffef9fe8bdd5483bae02f3fb1efa5055d288babb5d0232f"
+    "8acf487caabbc85b3627c516a4b661ac0c2847793f38ae5e25c6af35aebcb0f3"
+    "bcbdfda4870d143d90e4de5d1d4681f1286d2f2c5e972d892a51723c200259b1"
+    "9893051e3fa18a69300e70848bae97a10895634cc7e85d59ca782a2387ac6f04"
+    "33b161b9f095da33cce04c8268821451be491c58a28b054e9837eb940b0122dc"
+    "b319ca77a66e97ff8a535ac524e4af6ea82b53a4be96a57bce2256a3f1cf14a5"
+)
+
+PKG_PUBLIC_KEYS = (
+    bytes.fromhex(
+        "d6aa0c5c0d6dc9e5ee28f9aa8dbc7236699617b65f8a4d969c8841330cb3fba0"
+        "d6332d202fe30dade07a3e4a282f76291b4f8a347436c8c940464db2beedcb72"
+        "3e81ffa3ac52a24513c781b2215cbe979d070e8fc846e9bba6a56ed44887bbe6"
+        "f60c486650109aab0f36b01f28e056e408d376629f0703263676b58eb3739266"
+        "5857943acfbc212ba008ba2c378118f7d81ea91a456895bf16861735309a79bf"
+        "a9db96c21f0d9ffc8b3b4f81eaad87f6730f709a2918398e9c369a23bc94069b"
+        "1b7b34a18b5f06c47965e965b3fbf6132fb7c0b54e488eb661a995d83e7f57e0"
+        "7b4e2125096f5f474d333c0634ae85e89d4806bdd1ee0c9cef63414c26fdc88f"
+    ),
+    bytes.fromhex(
+        "b96953eea54b1eb2f715eab62172bcec4d8fd39d483609d4f632043aab2057d9"
+        "510fed357af9863cc8cf652427dc86b2816c480d5f30cb16c733b43ed38cc19c"
+        "e21ad682c1ed9226a2408bd4c0807f9fbda64b942092f7f42dcb88e5135f92d2"
+        "b1b9097995ab0e42e3ca3691159deda93ac1b0a218d71e128ad2db114fbde532"
+        "8b613753ea4a4ae6fdf94b4d8ede120ebf414e3c76e0c9398cd92db8a5f48833"
+        "f3364fa98bbb9289ecb2a8de9fd9cfeda74e55769bed39c5e1ab0c5d89075e2b"
+        "339c6da748aa2c5799a7d48aff910a554aaf344a07cced8c1de45c54d6b4bdda"
+        "5995f16e64c6da016556254779855e4c9768e7fddfd7d7df56bd173fa5ddcedd"
+    ),
+    bytes.fromhex(
+        "9d2a60a2538fa218d1a636de7cce7af8950b726b52753a2419a4545ca75eccb3"
+        "43abae8384ca0b7ffd269d7e4d369d0547aada16f33a56eb9e37657cfcd93ede"
+        "e62bab0978f15d99dd57ba5b17a65055d5939230d77a3bd47c5dbd1e78d6d2c7"
+        "c184d3bd4e7fb8927db6e6ec61d81796bd31fbdbb6ac58df6943c8a8cacf0308"
+        "f46f28b8ff975a7d7331dbb362d40736403c5d6597a54fd1dad91534be98c80a"
+        "33741413814c51d0eee4fa5660c42f7ca6a9dd0a1110bdf498b1f1c9f81e7431"
+        "bdd6ce91d0abdb1ec93f0340947a6e6bf04c78df463163c3b3208da239354e6a"
+        "d9a78d9fce9da46042137791524d45bfc84696b87c0a7b2cfadf3943ce86dde9"
+    ),
+    bytes.fromhex(
+        "d212fc335f6ddb831609628b0356273782d477853529392d526b8c4c8cfb06c1"
+        "845be7d4f7bcd24e6245cd2abbd77776453655273fb3f5f98eda4befaa59aeb3"
+        "9bea5498d206326a58312ae0d44f90b50a7decf43a9c52672d99318e0c43e682"
+        "fe0746e12e50d41f2d2f7ed908ba06b3bf2e203f4e3ffe44ffaa504357916994"
+        "49158282e40f4c8d9d2cc95b1d64bf888bd4c594e76547841ee57910fb989347"
+        "b97d8512a640982cf792bc951932ede890560d65c1aa78c62e54fd5f54a1f67e"
+        "e5e05f61c120b4b9b4330870e4df8956ed012946775f8cb8a9f51e2eb3b9bfe0"
+        "09b78d28d4a6c3b81e1f07ebb4120b95b88530fddc3913d07cdc8fedf9c9a3c1"
+    ),
+    bytes.fromhex(
+        "c9b2402b79556af9605e098644e865579f3df6f4800d230cd5ee4bc18d5a782a"
+        "94224fd9959d863d48b3b97c6fb8939fffccc39019a464959e6bda17240be0ac"
+        "f6b2bbbe1ccca2e377fb410cdce3389e86a26fe5a67d9694beffc76fce4c829b"
+        "679108b2c3b472f4ad2f4c4ca3f4c9712e3acc1e50d19941c55097b41004e8ab"
+        "4e2b897ca8e1bfea7fac3c15e5b2394c449d823674bf0a84232bcabf01193f52"
+        "06fb5aac28c68fbf70057033b4e6cc854e54cd181c380058056192c945a972f0"
+        "690089bcb2342b79f68f536e8050c38388e736838c7ddf67433f5678527c09ab"
+        "ac80c58498716116d78c05e003e1ccbaa7a7416d35487ca06d5b9ec2d24395c7"
+    ),
+    bytes.fromhex(
+        "e356f16b5dff3c7dff42e79a32c144e83bde58df19bb9c4a0f5aff153902de76"
+        "65bf2a7162ee0d34a28d73718393ea0591231743c806381a95e5806ad0acdd8c"
+        "91fb1fd7a21a693d037cdd8e2db0b24cc4ab73ce65a1a3e6536341920b6e0877"
+        "772b9762c801df3c4b9a392cd2abde7d27e7a76a997da39e6e5a2baf172374f0"
+        "e6f7d07e1af7394bb79dba813af6757e020a1b86f70465b7571d50c982348f54"
+        "610c0a4bb8479ffcacc40f18bc3e80bddfa92dc88c89a7df5566c2b0ee5a2386"
+        "00eaa4851930ece86c0b302e3e6baac8d0185ac049002b3abc754cd3586a7642"
+        "4fc45ab1d1d72711fd5b4cb793708299de23f2c3de096c2ba7f264bf95489cd1"
+    ),
+    bytes.fromhex(
+        "e9cac344b4d96a2c5c255df0f1848c800d55f87e26326c3b0c1a14462d5fd057"
+        "d4a0b87c8bb6880ba9d3ac282c38c06d0a30fe80d71ab481d6a17622198db04c"
+        "c30f23382b1ba12b1bcb7ee0c5fc79960a537a11b3230471e63f2caeedd549b3"
+        "255fda807af1af91db1770a5221c5cafe606cde2118f6842e7942d8f25d23cc4"
+        "af98679fcf16be701e79b8c81f7046493906a1ff9e011ec0cf1dc8048061c22c"
+        "7869b23b4da20fdbb764b465baae2fc69b09fb6e497ce1a0182d6662abdec3c9"
+        "60fa67f3505526ae0fb5e0cdd3d9b673e299a6e1badd478d546512ebe924ff26"
+        "c2b8af07921a3b123171130363d0a6314d559599214cec48fd09e07585465b85"
+    ),
+)
+
+
+###############################################################################
+# Crypto primitives
+###############################################################################
+
+def sha256(*parts):
+    h = hashlib.sha256()
+    for p in parts:
+        h.update(p)
+    return h.digest()
+
+
+def hmac_sha256(key, data):
+    return hmac.new(key, data, hashlib.sha256).digest()
+
+
+def _xtime(a):
+    a <<= 1
+    return a ^ 0x11B if a & 0x100 else a
+
+
+def _make_aes_tables():
+    exp = [0] * 255
+    log = [0] * 256
+    x = 1
+    for i in range(255):
+        exp[i] = x
+        log[x] = i
+        x ^= _xtime(x)  # multiply by the generator 3
+    sbox = [0] * 256
+    for a in range(256):
+        inv = exp[(255 - log[a]) % 255] if a else 0
+        s = r = inv
+        for _ in range(4):
+            r = ((r << 1) | (r >> 7)) & 0xFF
+            s ^= r
+        sbox[a] = s ^ 0x63
+    t0 = []
+    for a in range(256):
+        s = sbox[a]
+        s2 = _xtime(s) & 0xFF
+        t0.append((s2 << 24) | (s << 16) | (s << 8) | (s2 ^ s))
+    t1 = [((w >> 8) | (w << 24)) & 0xFFFFFFFF for w in t0]
+    t2 = [((w >> 16) | (w << 16)) & 0xFFFFFFFF for w in t0]
+    t3 = [((w >> 24) | (w << 8)) & 0xFFFFFFFF for w in t0]
+    return sbox, t0, t1, t2, t3
+
+
+class PyAes128:
+    '''
+    A small table-driven AES-128 encryptor, used when the cryptography
+    package is not installed. Only encryption is needed to build a PKG.
+    '''
+
+    _tables = None
+
+    def __init__(self, key):
+        if PyAes128._tables is None:
+            PyAes128._tables = _make_aes_tables()
+        sbox = self._tables[0]
+        w = list(struct.unpack(">4I", key))
+        rcon = 1
+        for i in range(4, 44):
+            t = w[i - 1]
+            if i % 4 == 0:
+                t = ((sbox[(t >> 16) & 0xFF] << 24) | (sbox[(t >> 8) & 0xFF] << 16)
+                     | (sbox[t & 0xFF] << 8) | sbox[t >> 24]) ^ (rcon << 24)
+                rcon = _xtime(rcon) & 0xFF
+            w.append(w[i - 4] ^ t)
+        self.rk = w
+
+    def encrypt_block(self, block):
+        sbox, t0, t1, t2, t3 = self._tables
+        rk = self.rk
+        s0, s1, s2, s3 = struct.unpack(">4I", block)
+        s0 ^= rk[0]
+        s1 ^= rk[1]
+        s2 ^= rk[2]
+        s3 ^= rk[3]
+        for r in range(4, 40, 4):
+            s0, s1, s2, s3 = (
+                t0[s0 >> 24] ^ t1[(s1 >> 16) & 255] ^ t2[(s2 >> 8) & 255] ^ t3[s3 & 255] ^ rk[r],
+                t0[s1 >> 24] ^ t1[(s2 >> 16) & 255] ^ t2[(s3 >> 8) & 255] ^ t3[s0 & 255] ^ rk[r + 1],
+                t0[s2 >> 24] ^ t1[(s3 >> 16) & 255] ^ t2[(s0 >> 8) & 255] ^ t3[s1 & 255] ^ rk[r + 2],
+                t0[s3 >> 24] ^ t1[(s0 >> 16) & 255] ^ t2[(s1 >> 8) & 255] ^ t3[s2 & 255] ^ rk[r + 3])
+        return struct.pack(
+            ">4I",
+            ((sbox[s0 >> 24] << 24) | (sbox[(s1 >> 16) & 255] << 16)
+             | (sbox[(s2 >> 8) & 255] << 8) | sbox[s3 & 255]) ^ rk[40],
+            ((sbox[s1 >> 24] << 24) | (sbox[(s2 >> 16) & 255] << 16)
+             | (sbox[(s3 >> 8) & 255] << 8) | sbox[s0 & 255]) ^ rk[41],
+            ((sbox[s2 >> 24] << 24) | (sbox[(s3 >> 16) & 255] << 16)
+             | (sbox[(s0 >> 8) & 255] << 8) | sbox[s1 & 255]) ^ rk[42],
+            ((sbox[s3 >> 24] << 24) | (sbox[(s0 >> 16) & 255] << 16)
+             | (sbox[(s1 >> 8) & 255] << 8) | sbox[s2 & 255]) ^ rk[43])
+
+
+def aes128_cbc_encrypt(key, iv, data):
+    '''AES-128-CBC without padding.'''
+    if len(data) % 16:
+        raise ValueError("AES-CBC input must be a multiple of 16 bytes")
+    if not data:
+        return b""
+    if Cipher is not None:
+        enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+        return enc.update(data) + enc.finalize()
+    aes = PyAes128(key)
+    out = bytearray()
+    prev = int.from_bytes(iv, "big")
+    for i in range(0, len(data), 16):
+        block = aes.encrypt_block((int.from_bytes(data[i:i + 16], "big") ^ prev).to_bytes(16, "big"))
+        out += block
+        prev = int.from_bytes(block, "big")
+    return bytes(out)
+
+
+class XtsEncryptor:
+    '''AES-128-XTS on 4 KiB sectors; the tweak is the little-endian sector number.'''
+
+    def __init__(self, data_key, tweak_key):
+        self.data_key = data_key
+        self.tweak_key = tweak_key
+        if Cipher is None:
+            self.data_aes = PyAes128(data_key)
+            self.tweak_aes = PyAes128(tweak_key)
+        else:
+            self.algo = algorithms.AES(data_key + tweak_key)
+
+    def encrypt_sector(self, data, sector):
+        if Cipher is not None:
+            enc = Cipher(self.algo, modes.XTS(sector.to_bytes(16, "little"))).encryptor()
+            return enc.update(data) + enc.finalize()
+        mask = (1 << 128) - 1
+        t = int.from_bytes(self.tweak_aes.encrypt_block(sector.to_bytes(16, "little")), "little")
+        enc = self.data_aes.encrypt_block
+        out = bytearray(len(data))
+        for i in range(0, len(data), 16):
+            p = int.from_bytes(data[i:i + 16], "little") ^ t
+            c = int.from_bytes(enc(p.to_bytes(16, "little")), "little") ^ t
+            out[i:i + 16] = c.to_bytes(16, "little")
+            t <<= 1
+            if t >> 128:
+                t = (t & mask) ^ 0x87
+        return bytes(out)
+
+
+class MersenneTwister:
+    '''MT19937 seeded with init_by_array(), as used by LibOrbisPkg.'''
+
+    N = 624
+    M = 397
+
+    def __init__(self, key):
+        n = self.N
+        mt = [0] * n
+        mt[0] = 19650218
+        for i in range(1, n):
+            mt[i] = (1812433253 * (mt[i - 1] ^ (mt[i - 1] >> 30)) + i) & 0xFFFFFFFF
+        i, j = 1, 0
+        for _ in range(max(n, len(key))):
+            mt[i] = ((mt[i] ^ (((mt[i - 1] ^ (mt[i - 1] >> 30)) * 1664525) & 0xFFFFFFFF))
+                     + key[j] + j) & 0xFFFFFFFF
+            i += 1
+            j += 1
+            if i >= n:
+                mt[0] = mt[n - 1]
+                i = 1
+            if j >= len(key):
+                j = 0
+        for _ in range(n - 1):
+            mt[i] = ((mt[i] ^ (((mt[i - 1] ^ (mt[i - 1] >> 30)) * 1566083941) & 0xFFFFFFFF))
+                     - i) & 0xFFFFFFFF
+            i += 1
+            if i >= n:
+                mt[0] = mt[n - 1]
+                i = 1
+        mt[0] = 0x80000000
+        self.mt = mt
+        self.index = n
+
+    def next_u32(self):
+        mt = self.mt
+        n, m = self.N, self.M
+        if self.index >= n:
+            for k in range(n):
+                y = (mt[k] & 0x80000000) | (mt[(k + 1) % n] & 0x7FFFFFFF)
+                mt[k] = mt[(k + m) % n] ^ (y >> 1) ^ (0x9908B0DF if y & 1 else 0)
+            self.index = 0
+        y = mt[self.index]
+        self.index += 1
+        y ^= y >> 11
+        y ^= (y << 7) & 0x9D2C5680
+        y ^= (y << 15) & 0xEFC60000
+        y ^= y >> 18
+        return y & 0xFFFFFFFF
+
+
+def rsa2048_encrypt_key(modulus, data):
+    '''
+    RSA-2048 encrypt a 32-byte value with PKCS#1 v1.5 type 2 padding whose
+    "random" bytes are derived deterministically from the key and the value.
+    '''
+    assert len(modulus) == 256 and len(data) == 32
+    seed = sha256(sha256(modulus + data))
+    mt = MersenneTwister(list(struct.unpack(">8I", seed)))
+    padded = bytearray(256)
+    padded[1] = 2
+    padded[224:256] = data
+    k = 2
+    while k < 223:
+        rnd = sha256(struct.pack(">12I", *(mt.next_u32() for _ in range(12))))
+        for r in rnd:
+            if k >= 223:
+                break
+            if r:
+                padded[k] = r
+                k += 1
+    n = int.from_bytes(modulus, "big")
+    return pow(int.from_bytes(padded, "big"), 65537, n).to_bytes(256, "big")
+
+
+_SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def rsa2048_sign_sha256(digest, modulus, private_exponent):
+    '''RSASSA-PKCS1-v1_5 signature of a SHA-256 digest.'''
+    t = _SHA256_DIGEST_INFO + digest
+    em = b"\x00\x01" + b"\xff" * (256 - len(t) - 3) + b"\x00" + t
+    n = int.from_bytes(modulus, "big")
+    d = int.from_bytes(private_exponent, "big")
+    return pow(int.from_bytes(em, "big"), d, n).to_bytes(256, "big")
+
+
+def compute_key(content_id, passcode, index):
+    '''Derive passcode key number `index` (index 1 is the EKPFS).'''
+    return sha256(sha256(struct.pack(">I", index)),
+                  sha256(content_id.encode("ascii").ljust(48, b"\0")),
+                  passcode.encode("ascii", "replace"))
+
+
+def create_keystone(passcode):
+    header = bytes.fromhex("6b657973746f6e65020001000000000000000000000000000000000000000000")
+    fingerprint = hmac_sha256(KEYSTONE_HMAC_KEY, passcode.encode("ascii", "replace"))
+    return header + fingerprint + hmac_sha256(KEYSTONE_MAC_DATA, header + fingerprint)
+
+
+def pfs_crypto_key(ekpfs, seed, index):
+    return hmac_sha256(ekpfs, struct.pack("<I", index) + seed)
+
+
+###############################################################################
+# .NET string semantics
+###############################################################################
+
+# The order in which .NET's culture-aware comparer (ICU root collation) puts
+# printable ASCII characters. Letters compare case-insensitively first, and
+# lower case wins ties.
+_COLLATION_ORDER = (" _-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$"
+                    "0123456789abcdefghijklmnopqrstuvwxyz")
+_PRIMARY = {c: i for i, c in enumerate(_COLLATION_ORDER)}
+for _c in "abcdefghijklmnopqrstuvwxyz":
+    _PRIMARY[_c.upper()] = _PRIMARY[_c]
+
+
+def collation_key(s):
+    '''Sort key equivalent to .NET's default string comparison for ASCII.'''
+    if s is None:
+        return ((), ())  # null sorts first
+    primary = tuple(_PRIMARY.get(c, 0x10000 + ord(c)) for c in s)
+    tertiary = tuple(1 if "A" <= c <= "Z" else 0 for c in s)
+    return (primary, tertiary)
+
+
+def path_hash(path):
+    '''The flat_path_table hash of a path name.'''
+    h = 0
+    for c in path:
+        h = (ord(c.upper()) + 31 * h) & 0xFFFFFFFF
+    return h
+
+
+def align(value, alignment):
+    rem = value % alignment
+    return value + alignment - rem if rem else value
+
+
+def ceil_div(a, b):
+    return -(-a // b)
+
+
+###############################################################################
+# param.sfo
+###############################################################################
+
+SFO_UTF8_SPECIAL = 0x0004
+SFO_UTF8 = 0x0204
+SFO_INTEGER = 0x0404
+
+
+class SfoValue:
+    def __init__(self, name, type, value, max_length=4):
+        self.name = name
+        self.type = type
+        self.value = value
+        self.max_length = 4 if type == SFO_INTEGER else max_length
+
+    @property
+    def length(self):
+        if self.type == SFO_INTEGER:
+            return 4
+        if self.type == SFO_UTF8:
+            return len(self.value.encode("utf-8")) + 1
+        return len(self.value.encode("utf-16-le")) // 2
+
+    def to_bytes(self):
+        if self.type == SFO_INTEGER:
+            return struct.pack("<i", self.value)
+        if self.type == SFO_UTF8:
+            return self.value.encode("utf-8") + b"\0"
+        return self.value.encode("utf-8")
+
+    def __str__(self):
+        if self.type == SFO_INTEGER:
+            return f"0x{self.value & 0xFFFFFFFF:08x}"
+        return self.value
+
+
+class ParamSfo:
+    def __init__(self, values=None):
+        self.values = list(values or [])
+
+    def __getitem__(self, name):
+        for v in self.values:
+            if v.name == name:
+                return v
+        return None
+
+    def __setitem__(self, name, value):
+        self.values = [v for v in self.values if v.name != name]
+        value.name = name
+        self.values.append(value)
+
+    @staticmethod
+    def parse(data):
+        start = 0
+        if data[:4] == b"SCEC":
+            start = 0x800
+        if data[start:start + 4] != b"\0PSF":
+            raise ValueError("File is missing SFO magic")
+        key_table, data_table, count = struct.unpack_from("<iii", data, start + 8)
+        sfo = ParamSfo()
+        for i in range(count):
+            key_off, fmt, length, max_len, data_off = struct.unpack_from(
+                "<HHiiI", data, start + 0x14 + 0x10 * i)
+            kpos = start + key_table + key_off
+            name = data[kpos:data.index(b"\0", kpos)].decode("ascii", "replace")
+            dpos = start + data_table + data_off
+            if fmt == SFO_INTEGER:
+                value = struct.unpack_from("<i", data, dpos)[0]
+            elif fmt == SFO_UTF8:
+                n = length - 1 if length > 0 else length
+                value = data[dpos:dpos + n].decode("utf-8", "replace")
+            elif fmt == SFO_UTF8_SPECIAL:
+                value = data[dpos:dpos + length].decode("utf-8", "replace")
+            else:
+                raise ValueError(f"Unknown SFO type: {fmt:04X}")
+            sfo.values.append(SfoValue(name, fmt, value, max_len))
+        return sfo
+
+    def _sort(self):
+        self.values.sort(key=lambda v: collation_key(v.name))
+
+    def serialize(self):
+        self._sort()
+        key_table = 0x14 + 0x10 * len(self.values)
+        key_size = sum(len(v.name) + 1 for v in self.values)
+        data_table = align(key_table + key_size, 4)
+        out = bytearray(data_table + sum(v.max_length for v in self.values))
+        struct.pack_into("<4siiii", out, 0, b"\0PSF", 0x101, key_table, data_table,
+                         len(self.values))
+        key_off = data_off = 0
+        for i, v in enumerate(self.values):
+            raw = v.to_bytes()
+            if len(raw) > v.max_length:
+                raise ValueError(f"param.sfo value {v.name} is longer than its "
+                                 f"maximum length ({v.max_length})")
+            struct.pack_into("<HHiii", out, 0x14 + 0x10 * i, key_off, v.type,
+                             v.length, v.max_length, data_off)
+            name = v.name.encode("ascii", "replace")
+            out[key_table + key_off:key_table + key_off + len(name)] = name
+            out[data_table + data_off:data_table + data_off + len(raw)] = raw
+            key_off += len(v.name) + 1
+            data_off += v.max_length
+        return bytes(out)
+
+
+###############################################################################
+# GP4 projects
+###############################################################################
+
+class Gp4Error(Exception):
+    pass
+
+
+class Gp4Project:
+    VOLUME_TYPES = ("bd25", "bd50", "bd50_50", "bd50_25", "bd25_50", "exfat",
+                    "pfs_plain", "pfs_signed", "pfs_nested", "pkg_ps4_app",
+                    "pkg_ps4_patch", "pkg_ps4_remaster", "pkg_ps4_ac_data",
+                    "pkg_ps4_ac_nodata", "pkg_ps4_sf_theme", "pkg_ps4_theme")
+
+    def __init__(self, path):
+        self.path = path
+        self.dir = os.path.dirname(path)
+        try:
+            root = ET.parse(path).getroot()
+        except (ET.ParseError, OSError) as e:
+            raise Gp4Error(f"Could not read {path}: {e}") from e
+        if root.tag != "psproject":
+            raise Gp4Error(f"{path} is not a GP4 project")
+
+        volume = root.find("volume")
+        package = volume.find("package") if volume is not None else None
+        if package is None:
+            raise Gp4Error(f"{path} has no <volume>/<package> element")
+
+        def text(name):
+            elem = volume.find(name)
+            return elem.text.strip() if elem is not None and elem.text else None
+
+        self.volume_type = text("volume_type")
+        if self.volume_type not in self.VOLUME_TYPES:
+            raise Gp4Error(f"Unknown Volume Type: {self.volume_type}")
+        self.volume_ts = text("volume_ts")
+        self.content_id = package.get("content_id") or ""
+        self.passcode = package.get("passcode") or ""
+        self.entitlement_key = package.get("entitlement_key")
+        self.c_date = package.get("c_date")
+        if self.entitlement_key is None and self.volume_type in ("pkg_ps4_ac_data",
+                                                                 "pkg_ps4_ac_nodata"):
+            self.entitlement_key = "0" * 32
+
+        # (target path, source path) pairs, in project order
+        self.files = []
+        files = root.find("files")
+        for f in (files.findall("file") if files is not None else []):
+            targ = (f.get("targ_path") or "").replace("\\", "/").lstrip("/")
+            orig = f.get("orig_path")
+            if orig is None:
+                orig = targ.replace("/", os.sep)
+            self.files.append((targ, orig))
+
+        # Nested directory names, in project order
+        def dirs(elem):
+            return [(d.get("targ_name") or "", dirs(d)) for d in elem.findall("dir")]
+        rootdir = root.find("rootdir")
+        self.dirs = dirs(rootdir) if rootdir is not None else []
+
+    def source_path(self, orig):
+        path = os.path.join(self.dir, orig)
+        if not os.path.isfile(path) and "\\" in orig:
+            alt = os.path.join(self.dir, orig.replace("\\", "/"))
+            if os.path.isfile(alt):
+                return alt
+        return path
+
+    def timestamp(self):
+        '''The volume timestamp, in seconds since the epoch.'''
+        if not self.volume_ts:
+            return int(datetime.now().timestamp())
+        return int(parse_datetime(self.volume_ts).timestamp())
+
+
+def parse_datetime(text):
+    '''Parse a GP4 date/time. Values without a time zone are local time.'''
+    text = text.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S",
+                "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    raise Gp4Error(f"Could not parse date/time '{text}'")
+
+
+def validate_project(proj):
+    '''Returns a list of (fatal, message) tuples, mirroring PkgTool.Core.'''
+    results = []
+
+    def fatal(msg):
+        results.append((True, msg))
+
+    def warning(msg):
+        results.append((False, msg))
+
+    if len(proj.passcode) != 32:
+        fatal("Passcode must be 32 characters long.")
+    missing = [orig for _, orig in proj.files if not os.path.isfile(proj.source_path(orig))]
+    if missing:
+        fatal("Could not find source file(s): " + ", ".join(missing))
+    seen, dupes = set(), []
+    for targ, _ in proj.files:
+        if targ in seen and targ not in dupes:
+            dupes.append(targ)
+        seen.add(targ)
+    if dupes:
+        fatal("PKG has duplicate filename(s): " + ", ".join(dupes))
+    if len(proj.content_id) != 36:
+        fatal("PKG Content ID must be 36 characters long.")
+    if not re.match(r"^[A-Z]{2}[0-9]{4}-[A-Z]{4}[0-9]{5}_00-[A-Z0-9]{16}$", proj.content_id):
+        warning("PKG Content ID is the wrong format. "
+                "Format should be XXYYYY-XXXXYYYYY_00-ZZZZZZZZZZZZZZZZ, "
+                "where X is a letter, Y is a number, and Z is either.")
+    if proj.volume_type not in ("pkg_ps4_app", "pkg_ps4_ac_data", "pkg_ps4_ac_nodata"):
+        fatal("Unsupported PKG volume type: " + proj.volume_type)
+    for targ, orig in proj.files:
+        try:
+            targ.encode("ascii")
+        except UnicodeEncodeError:
+            fatal(f"File name {targ} is not ASCII; PFS names must be ASCII.")
+    for name in iter_dir_names(proj.dirs):
+        try:
+            name.encode("ascii")
+        except UnicodeEncodeError:
+            fatal(f"Directory name {name} is not ASCII; PFS names must be ASCII.")
+
+    sfo_files = [orig for targ, orig in proj.files if targ == "sce_sys/param.sfo"]
+    if not sfo_files or not os.path.isfile(proj.source_path(sfo_files[0])):
+        fatal("Required file sce_sys/param.sfo is missing.")
+        return results
+    try:
+        with open(proj.source_path(sfo_files[0]), "rb") as f:
+            sfo = ParamSfo.parse(f.read())
+    except (ValueError, IndexError, struct.error) as e:
+        fatal(f"Could not load param.sfo file: {e}")
+        return results
+
+    cid, tid, cat = sfo["CONTENT_ID"], sfo["TITLE_ID"], sfo["CATEGORY"]
+    if cid is None:
+        warning("param.sfo has no CONTENT_ID.")
+    elif proj.content_id != str(cid):
+        warning(f"PKG Content ID {proj.content_id} does not match CONTENT_ID {cid} "
+                "in param.sfo.")
+    if cid is not None and tid is not None and not str(cid)[7:].startswith(str(tid)):
+        warning(f"SFO TITLE_ID {tid} does not match the CONTENT_ID {cid}.")
+    if cat is not None:
+        cat = str(cat)
+        ok = True
+        if proj.volume_type == "pkg_ps4_app":
+            ok = cat.startswith("g")
+        elif proj.volume_type in ("pkg_ps4_ac_data", "pkg_ps4_ac_nodata",
+                                  "pkg_ps4_theme", "pkg_ps4_sf_theme"):
+            ok = cat == "ac"
+        if not ok:
+            warning(f"SFO CATEGORY {cat} is not valid for PKG volume type "
+                    f"{proj.volume_type}.")
+    return results
+
+
+def iter_dir_names(dirs):
+    for name, children in dirs:
+        yield name
+        yield from iter_dir_names(children)
+
+
+###############################################################################
+# PFS images
+###############################################################################
+
+INODE_MODE_RX = 0x16D  # r-xr-xr-x
+INODE_MODE_DIR = 0x4000 | INODE_MODE_RX
+INODE_MODE_FILE = 0x8000 | INODE_MODE_RX
+
+INODE_FLAG_COMPRESSED = 0x1
+INODE_FLAG_UNK2 = 0x4
+INODE_FLAG_UNK3 = 0x8
+INODE_FLAG_READONLY = 0x10
+INODE_FLAG_INTERNAL = 0x20000
+
+DIRENT_FILE = 2
+DIRENT_DIR = 3
+DIRENT_DOT = 4
+DIRENT_DOTDOT = 5
+DIRENT_MAX_SIZE = 280
+
+PFS_MODE_SIGNED = 0x1
+PFS_MODE_ENCRYPTED = 0x4
+PFS_MODE_ALWAYS = 0x8
+
+INODE_HEAD = struct.Struct("<HHIqq4q4I2I2QI")   # common to all inode kinds, 0x64 bytes
+DINODE_D32_SIZE = 0xA8
+DINODE_S32_SIZE = 0x2C8
+SIG_SIZE = 36  # 32-byte HMAC followed by a 32-bit block number
+
+
+class Inode:
+    def __init__(self, signed, mode, blocks, size=0, size_compressed=0, nlink=1,
+                 number=0, flags=0, time=0):
+        self.signed = signed
+        self.mode = mode
+        self.blocks = blocks
+        self.size = size
+        self.size_compressed = size_compressed
+        self.nlink = nlink
+        self.number = number
+        self.flags = flags
+        self.time = time
+        self.db = [0] * 12
+        self.ib = [0] * 5
+
+    @property
+    def start_block(self):
+        return self.db[0]
+
+    def _head(self):
+        t = self.time
+        return INODE_HEAD.pack(self.mode, self.nlink, self.flags, self.size,
+                               self.size_compressed, t, t, t, t, 0, 0, 0, 0, 0, 0, 0, 0,
+                               self.blocks)
+
+    def to_bytes(self):
+        if not self.signed:
+            return self._head() + struct.pack("<12i5i", *self.db, *self.ib)
+        sig = bytes(32)
+        return self._head() + b"".join(sig + struct.pack("<i", b) for b in self.db + self.ib)
+
+    def to_bytes_s64(self):
+        '''The 64-bit signed inode layout used for the superblock's inode-block record.'''
+        sig = bytes(32)
+        return (self._head() + bytes(4)
+                + b"".join(sig + struct.pack("<q", b) for b in self.db + self.ib))
+
+
+class Dirent:
+    def __init__(self, name, ino, type):
+        self.name = name
+        self.ino = ino
+        self.type = type
+
+    @property
+    def ent_size(self):
+        return align(len(self.name) + 17, 8)
+
+    def to_bytes(self):
+        name = self.name.encode("ascii")
+        return struct.pack("<Iiii", self.ino, self.type, len(name), self.ent_size) \
+            + name.ljust(self.ent_size - 16, b"\0")
+
+
+class FSNode:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.parent = parent
+        self.ino = None
+
+    def full_path(self, suffix=""):
+        if self.parent is None:
+            return suffix
+        return self.parent.full_path("/" + self.name + suffix)
+
+
+class FSDir(FSNode):
+    def __init__(self, name, parent=None):
+        super().__init__(name, parent)
+        self.dirs = []
+        self.files = []
+        self.dirents = []
+
+    @property
+    def size(self):
+        '''Bytes used by the dirents, which never straddle a block boundary.'''
+        pos = 0
+        for d in self.dirents:
+            pos += d.ent_size
+            if pos % BLOCK_SIZE > BLOCK_SIZE - DIRENT_MAX_SIZE:
+                pos = (pos // BLOCK_SIZE + 1) * BLOCK_SIZE
+        return max(pos, sum(d.ent_size for d in self.dirents))
+
+    def dirent_bytes(self):
+        out = bytearray(align(self.size, BLOCK_SIZE))
+        pos = 0
+        for d in self.dirents:
+            raw = d.to_bytes()
+            out[pos:pos + len(raw)] = raw
+            pos += len(raw)
+            if pos % BLOCK_SIZE > BLOCK_SIZE - DIRENT_MAX_SIZE:
+                pos = (pos // BLOCK_SIZE + 1) * BLOCK_SIZE
+        return bytes(out[:self.size])
+
+    def all_dirs(self):
+        ret = list(self.dirs)
+        for d in self.dirs:
+            ret += d.all_dirs()
+        return ret
+
+    def all_files(self):
+        ret = list(self.files)
+        for d in self.all_dirs():
+            ret += d.files
+        return ret
+
+    def get_dir(self, name):
+        for d in self.dirs:
+            if d.name == name:
+                return d
+        return None
+
+    def get_file(self, path):
+        head, _, rest = path.partition("/")
+        if not rest:
+            for f in self.files:
+                if f.name == path:
+                    return f
+            return None
+        d = self.get_dir(head)
+        return d.get_file(rest) if d else None
+
+
+class FSFile(FSNode):
+    '''
+    A file whose content is a host file (`path`), a byte string (`data`),
+    or produced by `chunks()`, a callable returning an iterable of bytes.
+    '''
+
+    def __init__(self, name, parent=None, path=None, data=None, chunks=None, size=None,
+                 compressed_size=None, compress=False):
+        super().__init__(name, parent)
+        self.path = path
+        self.data = data
+        self.chunks = chunks
+        if size is None:
+            size = len(data) if data is not None else os.path.getsize(path)
+        self.size = size
+        self.compressed_size = size if compressed_size is None else compressed_size
+        self.compress = compress
+
+    def read_chunks(self, chunk_size=1 << 20):
+        if self.data is not None:
+            yield self.data
+            return
+        if self.chunks is not None:
+            yield from self.chunks()
+            return
+        remaining = self.size
+        with open(self.path, "rb") as f:
+            while remaining > 0:
+                buf = f.read(min(chunk_size, remaining))
+                if not buf:
+                    break
+                remaining -= len(buf)
+                yield buf
+        if remaining:
+            raise IOError(f"{self.path} changed size while building the PKG")
+
+    def read_all(self):
+        return b"".join(self.read_chunks())
+
+
+def is_entry_file(node, root):
+    '''True if `node` is sce_sys/<name> where <name> is stored as a PKG entry.'''
+    name = node.name
+    parent = node.parent
+    while parent is not None and parent is not root:
+        if parent.parent is root and parent.name == "sce_sys":
+            return name in ENTRY_NAME_TO_ID
+        name = parent.name + "/" + name
+        parent = parent.parent
+    return False
+
+
+class PfsBuilder:
+    '''Lays out a PFS image (see LibOrbisPkg's PfsBuilder).'''
+
+    def __init__(self, root, file_time, sign=False, encrypt=False, ekpfs=None,
+                 seed=None, min_blocks=0):
+        self.root = root
+        self.file_time = file_time
+        self.sign = sign
+        self.encrypt = encrypt
+        self.ekpfs = ekpfs
+        self.seed = seed if (sign or encrypt) else None
+        self.min_blocks = min_blocks
+        self.mode = ((PFS_MODE_SIGNED if sign else 0) | (PFS_MODE_ENCRYPTED if encrypt else 0)
+                     | PFS_MODE_ALWAYS)
+        self.inode_size = DINODE_S32_SIZE if sign else DINODE_D32_SIZE
+        self.empty_block = 4
+
+        # Signatures to compute, as (block, signature offset, signed size).
+        # Data block signatures are kept as runs (first block, count, first
+        # signature offset) with consecutive signatures 36 bytes apart.
+        self.final_sigs = [(0, 0x380, 0x5A0)]
+        self.data_sig_runs = []
+
+        self.inodes = []
+        self.inode_block_sig = Inode(True, 0, 1, BLOCK_SIZE, BLOCK_SIZE, 1, 0,
+                                     INODE_FLAG_READONLY, file_time)
+
+        self.all_dirs = root.all_dirs()
+        self.all_files = [f for f in root.all_files() if not is_entry_file(f, root)]
+        self.all_nodes = (sorted(self.all_dirs, key=lambda d: collation_key(d.full_path()))
+                          + self.all_files)
+        hashes = [path_hash(n.full_path()) for n in self.all_nodes]
+        self.setup_root_structure(len(set(hashes)) != len(hashes))
+        self.add_dir_inodes()
+        self.add_file_inodes()
+        self.make_flat_path_table()
+        self.all_nodes.insert(0, root)
+        self.calculate_data_block_layout()
+
+    @property
+    def size(self):
+        return self.ndblock * BLOCK_SIZE
+
+    def make_inode(self, mode, blocks, size=0, size_compressed=0, nlink=1, number=0,
+                   flags=0):
+        if self.sign:
+            flags |= INODE_FLAG_UNK2 | INODE_FLAG_UNK3
+        return Inode(self.sign, mode, blocks, size, size_compressed, nlink, number, flags,
+                     self.file_time)
+
+    def setup_root_structure(self, has_collision):
+        num = 0
+        self.super_root_ino = self.make_inode(INODE_MODE_DIR, 1, BLOCK_SIZE, BLOCK_SIZE, 1, num,
+                                              INODE_FLAG_INTERNAL | INODE_FLAG_READONLY)
+        self.inodes.append(self.super_root_ino)
+        num += 1
+        self.fpt_ino = self.make_inode(INODE_MODE_FILE, 1, number=num,
+                                       flags=INODE_FLAG_INTERNAL | INODE_FLAG_READONLY)
+        self.inodes.append(self.fpt_ino)
+        num += 1
+        self.cr_ino = None
+        if has_collision:
+            self.cr_ino = self.make_inode(INODE_MODE_FILE, 1, number=num,
+                                          flags=INODE_FLAG_INTERNAL | INODE_FLAG_READONLY)
+            self.inodes.append(self.cr_ino)
+            num += 1
+        uroot_ino = self.make_inode(INODE_MODE_DIR, 1, BLOCK_SIZE, BLOCK_SIZE, 3, num,
+                                    INODE_FLAG_READONLY)
+        self.super_root_dirents = [Dirent("flat_path_table", self.fpt_ino.number, DIRENT_FILE)]
+        if has_collision:
+            self.super_root_dirents.append(
+                Dirent("collision_resolver", self.cr_ino.number, DIRENT_FILE))
+        self.super_root_dirents.append(Dirent("uroot", uroot_ino.number, DIRENT_DIR))
+        self.root.name = "uroot"
+        self.root.ino = uroot_ino
+        self.root.dirents = [Dirent(".", uroot_ino.number, DIRENT_DOT),
+                             Dirent("..", uroot_ino.number, DIRENT_DOTDOT)]
+        if self.sign:  # the outer image lacks the read-only flags
+            for ino in (self.super_root_ino, self.fpt_ino, uroot_ino):
+                ino.flags &= ~INODE_FLAG_READONLY
+
+    def add_dir_inodes(self):
+        self.inodes.append(self.root.ino)
+        for d in sorted(self.all_dirs, key=lambda d: collation_key(d.full_path())):
+            ino = self.make_inode(INODE_MODE_DIR, 1, BLOCK_SIZE, number=len(self.inodes),
+                                  flags=INODE_FLAG_READONLY, nlink=2)
+            d.ino = ino
+            d.dirents = [Dirent(".", ino.number, DIRENT_DOT),
+                         Dirent("..", d.parent.ino.number, DIRENT_DOTDOT)]
+            d.parent.dirents.append(Dirent(d.name, len(self.inodes), DIRENT_DIR))
+            d.parent.ino.nlink += 1
+            self.inodes.append(ino)
+
+    def add_file_inodes(self):
+        for f in sorted(self.all_files, key=lambda f: collation_key(f.full_path())):
+            ino = self.make_inode(INODE_MODE_FILE, ceil_div(f.size, BLOCK_SIZE), f.size,
+                                  f.compressed_size, number=len(self.inodes),
+                                  flags=INODE_FLAG_READONLY
+                                  | (INODE_FLAG_COMPRESSED if f.compress else 0))
+            if self.sign:
+                ino.flags &= ~INODE_FLAG_READONLY
+            f.ino = ino
+            f.parent.dirents.append(Dirent(f.name, len(self.inodes), DIRENT_FILE))
+            self.inodes.append(ino)
+
+    def make_flat_path_table(self):
+        table = {}
+        groups = {}
+        for n in self.all_nodes:
+            h = path_hash(n.full_path())
+            if h in table:
+                table[h] = 0x80000000
+                groups[h].append(n)
+            else:
+                table[h] = n.ino.number | (0x20000000 if isinstance(n, FSDir) else 0)
+                groups[h] = [n]
+        self.collisions = None
+        if 0x80000000 in table.values():
+            self.collisions = []
+            offset = 0
+            for h in sorted(table):
+                if table[h] != 0x80000000:
+                    continue
+                table[h] = 0x80000000 | offset
+                ents = [Dirent(n.full_path(), n.ino.number,
+                               DIRENT_DIR if isinstance(n, FSDir) else DIRENT_FILE)
+                        for n in groups[h]]
+                self.collisions.append(ents)
+                offset += sum(e.ent_size for e in ents) + 0x18
+        self.fpt = b"".join(struct.pack("<II", h, table[h]) for h in sorted(table))
+        self.cr = None
+        if self.collisions is not None:
+            cr = bytearray()
+            for ents in self.collisions:
+                cr += b"".join(e.to_bytes() for e in ents) + bytes(0x18)
+            self.cr = bytes(cr)
+
+    def ino_offset(self, number, db=0):
+        '''Offset of the db[] signature of a signed inode.'''
+        return BLOCK_SIZE + DINODE_S32_SIZE * number + 0x64 + SIG_SIZE * db
+
+    @staticmethod
+    def indirect_blocks(size):
+        sigs_per_block = BLOCK_SIZE // SIG_SIZE
+        blocks = ceil_div(size, BLOCK_SIZE)
+        ib = 0
+        if blocks > 12:
+            blocks -= 12
+            ib += 1
+        if blocks > sigs_per_block:
+            blocks -= sigs_per_block
+            ib += 1 + ceil_div(blocks, sigs_per_block)
+        return ib
+
+    def node_size(self, n):
+        return n.size
+
+    def calculate_data_block_layout(self):
+        hdr_sig = self.inode_block_sig
+        inodes_per_block = BLOCK_SIZE // self.inode_size
+        self.dinode_count = len(self.inodes)
+        self.dinode_block_count = ceil_div(len(self.inodes), inodes_per_block)
+        hdr_sig.blocks = self.dinode_block_count
+        hdr_sig.size = hdr_sig.size_compressed = self.dinode_block_count * BLOCK_SIZE
+        if self.sign:
+            self._layout_signed()
+        else:
+            self._layout_plain()
+        self.ndblock = max(self.ndblock, self.min_blocks)
+
+    def _layout_signed(self):
+        hdr_sig = self.inode_block_sig
+        hdr_sig.flags = 0
+        if self.dinode_block_count > 12:
+            raise ValueError("too many inodes in the outer PFS image")
+        nd = 1
+        for i in range(self.dinode_block_count):
+            hdr_sig.db[i] = 1 + i
+            self.final_sigs.append((1 + i, 0xB8 + SIG_SIZE * i, BLOCK_SIZE))
+        nd += self.dinode_block_count
+        sr = self.super_root_ino
+        sr.db[0] = self.dinode_block_count + 1
+        self.final_sigs.append((sr.start_block, self.ino_offset(sr.number), BLOCK_SIZE))
+        nd += sr.blocks
+
+        fpt = self.fpt_ino
+        fpt.db[0] = sr.start_block + 1
+        fpt.size = fpt.size_compressed = len(self.fpt)
+        fpt.blocks = ceil_div(len(self.fpt), BLOCK_SIZE)
+        self.final_sigs.append((fpt.start_block, self.ino_offset(fpt.number), BLOCK_SIZE))
+        for i in range(1, min(fpt.blocks, 12)):
+            fpt.db[i] = nd
+            nd += 1
+            self.final_sigs.append((fpt.start_block, self.ino_offset(fpt.number, i), BLOCK_SIZE))
+        if self.cr is not None:
+            raise ValueError("path hash collision in the outer PFS image")
+
+        nd += 1                # an empty block follows the flat path table
+        self.empty_block = nd  # a block of zeroes that is not encrypted
+        nd += 1
+
+        ib_start = nd
+        nd += sum(self.indirect_blocks(self.node_size(n)) for n in self.all_nodes)
+
+        spb = BLOCK_SIZE // SIG_SIZE
+        for n in self.all_nodes:
+            size = self.node_size(n)
+            blocks = ceil_div(size, BLOCK_SIZE)
+            ino = n.ino
+            ino.db[0] = nd
+            ino.blocks = blocks
+            ino.size = align(size, BLOCK_SIZE) if isinstance(n, FSDir) else size
+            if ino.size_compressed == 0:
+                ino.size_compressed = ino.size
+            count = min(blocks, 12)
+            if count:
+                self.data_sig_runs.append((nd, count, self.ino_offset(ino.number)))
+                nd += count
+            if blocks > 12:
+                self.final_sigs.append((ib_start, self.ino_offset(ino.number, 12), BLOCK_SIZE))
+                count = min(blocks - 12, spb)
+                self.data_sig_runs.append((nd, count, ib_start * BLOCK_SIZE))
+                nd += count
+                ib_start += 1
+            if blocks > 12 + spb:
+                done = 12 + spb
+                self.final_sigs.append((ib_start, self.ino_offset(ino.number, 13), BLOCK_SIZE))
+                ib1 = ib_start
+                for i in range(spb):
+                    if done >= blocks:
+                        break
+                    ib_start += 1
+                    self.final_sigs.append((ib_start, ib1 * BLOCK_SIZE + i * SIG_SIZE,
+                                            BLOCK_SIZE))
+                    count = min(spb, blocks - done)
+                    self.data_sig_runs.append((nd, count, ib_start * BLOCK_SIZE))
+                    nd += count
+                    done += count
+        self.ndblock = nd
+
+    def _layout_plain(self):
+        hdr_sig = self.inode_block_sig
+        nd = 1
+        hdr_sig.db[0] = nd
+        nd += 1
+        for i in range(1, self.dinode_block_count):
+            if i < 12:
+                hdr_sig.db[i] = -1
+            nd += 1
+        sr = self.super_root_ino
+        sr.db[0] = nd
+        nd += sr.blocks
+
+        def place(ino, data):
+            nonlocal nd
+            ino.db[0] = nd
+            nd += 1
+            ino.size = ino.size_compressed = len(data)
+            ino.blocks = ceil_div(len(data), BLOCK_SIZE)
+            for i in range(1, ino.blocks):
+                if i < 12:
+                    ino.db[i] = nd
+                nd += 1
+
+        place(self.fpt_ino, self.fpt)
+        if self.cr is None:
+            nd += 1  # an empty block follows the flat path table
+        else:
+            place(self.cr_ino, self.cr)
+
+        for n in self.all_nodes:
+            size = self.node_size(n)
+            blocks = ceil_div(size, BLOCK_SIZE)
+            ino = n.ino
+            ino.db[0] = nd
+            ino.blocks = blocks
+            ino.size = align(size, BLOCK_SIZE) if isinstance(n, FSDir) else size
+            if ino.size_compressed == 0:
+                ino.size_compressed = ino.size
+            for i in range(1, min(blocks, 12)):
+                ino.db[i] = -1
+            nd += blocks
+        self.ndblock = nd
+
+    def header_bytes(self):
+        out = bytearray(0x5A0)
+        struct.pack_into("<qqqBBBBHHIIqqqqq", out, 0, 1, 20130315, 0, 0, 0, 1, 0,
+                         self.mode, 0, BLOCK_SIZE, 0, 1, self.dinode_count, self.ndblock,
+                         self.dinode_block_count, 0)
+        sig = self.inode_block_sig.to_bytes_s64()
+        out[0x50:0x50 + len(sig)] = sig
+        if self.seed is not None:
+            struct.pack_into("<i", out, 0x36C, 1)
+            out[0x370:0x380] = self.seed
+        else:
+            struct.pack_into("<i", out, 0x368, 1)
+        return bytes(out)
+
+    def inode_table_bytes(self):
+        out = bytearray(self.dinode_block_count * BLOCK_SIZE)
+        pos = 0
+        for ino in self.inodes:
+            raw = ino.to_bytes()
+            out[pos:pos + len(raw)] = raw
+            pos += len(raw)
+            if pos % BLOCK_SIZE > BLOCK_SIZE - self.inode_size:
+                pos += BLOCK_SIZE - pos % BLOCK_SIZE
+        return bytes(out)
+
+    def segments(self):
+        '''
+        The image contents as a sorted list of (offset, bytes or FSFile).
+        Everything not covered is zero.
+        '''
+        segs = [(0, self.header_bytes()),
+                (BLOCK_SIZE, self.inode_table_bytes()),
+                (BLOCK_SIZE * (self.dinode_block_count + 1),
+                 b"".join(d.to_bytes() for d in self.super_root_dirents)),
+                (self.fpt_ino.start_block * BLOCK_SIZE, self.fpt)]
+        if self.cr is not None:
+            segs.append((self.cr_ino.start_block * BLOCK_SIZE, self.cr))
+        for n in self.all_nodes:
+            if isinstance(n, FSDir):
+                segs.append((n.ino.start_block * BLOCK_SIZE, n.dirent_bytes()))
+            elif n.size:
+                segs.append((n.ino.start_block * BLOCK_SIZE, n))
+        segs.sort(key=lambda s: s[0])
+        pos = 0
+        for off, payload in segs:
+            if off < pos:
+                raise ValueError("internal error: overlapping PFS data")
+            pos = off + (payload.size if isinstance(payload, FSFile) else len(payload))
+        if pos > self.size:
+            raise ValueError("internal error: PFS data exceeds the image size")
+        return segs
+
+    def stream(self):
+        '''Yields the whole image as a sequence of byte strings.'''
+        pos = 0
+        for off, payload in self.segments():
+            if off > pos:
+                yield from zeros(off - pos)
+            if isinstance(payload, FSFile):
+                for chunk in payload.read_chunks():
+                    yield chunk
+                pos = off + payload.size
+            else:
+                yield payload
+                pos = off + len(payload)
+        if self.size > pos:
+            yield from zeros(self.size - pos)
+
+
+_ZERO_CHUNK = bytes(1 << 20)
+
+
+def zeros(n):
+    while n > 0:
+        k = min(n, len(_ZERO_CHUNK))
+        yield _ZERO_CHUNK[:k] if k < len(_ZERO_CHUNK) else _ZERO_CHUNK
+        n -= k
+
+
+class ChunkReader:
+    '''Reads exact-sized pieces from an iterable of byte strings.'''
+
+    def __init__(self, chunks):
+        self.it = iter(chunks)
+        self.buf = bytearray()
+
+    def read(self, n):
+        while len(self.buf) < n:
+            try:
+                self.buf += next(self.it)
+            except StopIteration:
+                break
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+
+def pfsc_stream(inner):
+    '''An uncompressed PFSC container around a PFS image builder.'''
+    size = inner.size
+    num_blocks = ceil_div(size, BLOCK_SIZE)
+    extra = ((8 + num_blocks * 8 - 0xFC00) + 0xFFFF) // 0x10000
+    header_size = BLOCK_SIZE + (BLOCK_SIZE * extra if extra > 0 else 0)
+
+    def chunks():
+        hdr = bytearray(header_size)
+        struct.pack_into(">I", hdr, 0, 0x50465343)  # "PFSC"
+        struct.pack_into("<iiiqqqq", hdr, 4, 0, 6, BLOCK_SIZE, BLOCK_SIZE, 0x400,
+                         header_size, num_blocks * BLOCK_SIZE)
+        struct.pack_into(f"<{num_blocks + 1}q", hdr, 0x400,
+                         *range(header_size, header_size + (num_blocks + 1) * BLOCK_SIZE,
+                                BLOCK_SIZE))
+        yield bytes(hdr)
+        yield from inner.stream()
+
+    return chunks, header_size + size, size
+
+
+###############################################################################
+# PKG entries
+###############################################################################
+
+ENTRY_DIGESTS = 0x0001
+ENTRY_ENTRY_KEYS = 0x0010
+ENTRY_IMAGE_KEY = 0x0020
+ENTRY_GENERAL_DIGESTS = 0x0080
+ENTRY_METAS = 0x0100
+ENTRY_ENTRY_NAMES = 0x0200
+ENTRY_LICENSE_DAT = 0x0400
+ENTRY_LICENSE_INFO = 0x0401
+ENTRY_PSRESERVED_DAT = 0x0409
+ENTRY_PARAM_SFO = 0x1000
+ENTRY_PLAYGO_CHUNK_DAT = 0x1001
+ENTRY_PLAYGO_CHUNK_SHA = 0x1002
+ENTRY_PLAYGO_MANIFEST_XML = 0x1003
+
+
+def _entry_names():
+    names = {
+        0x0001: ".digests", 0x0010: ".entry_keys", 0x0020: ".image_key",
+        0x0080: ".general_digests", 0x0100: ".metas", 0x0200: ".entry_names",
+        0x0400: "license.dat", 0x0401: "license.info", 0x0402: "nptitle.dat",
+        0x0403: "npbind.dat", 0x0404: "selfinfo.dat", 0x0406: "imageinfo.dat",
+        0x0407: "target-deltainfo.dat", 0x0408: "origin-deltainfo.dat",
+        0x0409: "psreserved.dat", 0x1000: "param.sfo", 0x1001: "playgo-chunk.dat",
+        0x1002: "playgo-chunk.sha", 0x1003: "playgo-manifest.xml",
+        0x1004: "pronunciation.xml", 0x1005: "pronunciation.sig", 0x1006: "pic1.png",
+        0x1007: "pubtoolinfo.dat", 0x1008: "app/playgo-chunk.dat",
+        0x1009: "app/playgo-chunk.sha", 0x100A: "app/playgo-manifest.xml",
+        0x100B: "shareparam.json", 0x100C: "shareoverlayimage.png",
+        0x100D: "save_data.png", 0x100E: "shareprivacyguardimage.png",
+        0x1200: "icon0.png", 0x1220: "pic0.png", 0x1240: "snd0.at9",
+        0x1260: "changeinfo/changeinfo.xml", 0x1280: "icon0.dds", 0x12A0: "pic0.dds",
+        0x12C0: "pic1.dds",
+    }
+    for i in range(31):
+        names[0x1201 + i] = f"icon0_{i:02d}.png"
+        names[0x1281 + i] = f"icon0_{i:02d}.dds"
+        names[0x1241 + i] = f"pic1_{i:02d}.png"
+        names[0x12C1 + i] = f"pic1_{i:02d}.dds"
+        names[0x1261 + i] = f"changeinfo/changeinfo_{i:02d}.xml"
+        if i < 10:
+            names[0x1600 + i] = f"keymap_rp/{i + 1:03d}.png"
+        for j in range(10):
+            names[0x1610 + 16 * i + j] = f"keymap_rp/{i:02d}/{j + 1:03d}.png"
+    for i in range(100):
+        names[0x1400 + i] = f"trophy/trophy{i:02d}.trp"
+    return names
+
+
+ENTRY_ID_TO_NAME = _entry_names()
+ENTRY_NAME_TO_ID = {v: k for k, v in ENTRY_ID_TO_NAME.items()}
+
+CONTENT_TYPE_GD = 0x1A
+CONTENT_TYPE_AC = 0x1B
+CONTENT_TYPE_AL = 0x1C
+
+CONTENT_FLAG_GD_AC = 0x02000000
+CONTENT_FLAG_UNK_X8000000 = 0x08000000
+
+DRM_TYPE_PS4 = 0xF
+
+PLAYGO_MANIFEST = (
+    "﻿<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\r\n"
+    "<psproject fmt=\"playgo-manifest\" version=\"0990\">\r\n"
+    "  <volume>\r\n"
+    "    <chunk_info chunk_count=\"1\" scenario_count=\"1\">\r\n"
+    "      <scenarios default_id=\"0\">\r\n"
+    "        <scenario id=\"0\" type=\"sp\" initial_chunk_count=\"1\" "
+    "label=\"Scenario #0\">0</scenario>\r\n"
+    "      </scenarios>\r\n"
+    "    </chunk_info>\r\n"
+    "  </volume>\r\n"
+    "</psproject>\r\n").encode("utf-8")
+
+
+def entry_keys_data(content_id, passcode):
+    seed_digest = sha256(content_id.encode("ascii").ljust(48, b"\0"))
+    digests, keys = [], []
+    for i in range(7):
+        key = compute_key(content_id, passcode, i)
+        digests.append(bytes(a ^ b for a, b in zip(sha256(key), key)))
+        keys.append(rsa2048_encrypt_key(PKG_PUBLIC_KEYS[i], key))
+    keys[0] = rsa2048_encrypt_key(PKG_PUBLIC_KEYS[0], passcode.encode("ascii", "replace"))
+    return seed_digest + b"".join(digests) + b"".join(keys)
+
+
+def license_dat_data(content_id, content_type, entitlement_key):
+    secret_iv_src = sha256(content_id.encode("ascii").ljust(48, b"\0"))
+    secret_iv = secret_iv_src[:16]
+    secret = bytearray(144)
+    secret[0:16] = secret_iv_src[16:32]
+    if entitlement_key is not None and len(entitlement_key) == 16:
+        secret[0x70:0x80] = entitlement_key
+    secret = aes128_cbc_encrypt(RIF_DEBUG_KEY, secret_iv, bytes(secret))
+    sku_flag = 3 if content_type == CONTENT_TYPE_GD else 0
+    out = bytearray(0x400)
+    struct.pack_into(">IhhQqq", out, 0, 0x52494600, 1, -1, 0, 1364222275, 0x7FFFFFFFFFFFFFFF)
+    out[0x20:0x20 + 36] = content_id.encode("ascii")
+    struct.pack_into(">hhhhiiiii", out, 0x50, 0x200, DRM_TYPE_PS4, content_type, sku_flag,
+                     0, 0, 0, 1, 0)
+    out[0x240:0x260] = bytes(32)  # disc key
+    out[0x260:0x270] = secret_iv
+    out[0x270:0x300] = secret
+    out[0x300:0x400] = rsa2048_sign_sha256(sha256(bytes(out[:0x300])), DEBUG_RIF_MODULUS,
+                                           DEBUG_RIF_PRIVATE_EXPONENT)
+    return bytes(out)
+
+
+def license_info_data(content_id, content_type, entitlement_key):
+    out = bytearray(0x200)
+    out[0:36] = content_id.encode("ascii")
+    out[48:64] = entitlement_key if entitlement_key is not None else bytes(16)
+    struct.pack_into(">iiii", out, 64, 1 if content_type == CONTENT_TYPE_AL else 0,
+                     content_type, 0, 1)
+    return bytes(out)
+
+
+def playgo_chunk_dat(content_id, package_size, inner_pfs_size):
+    out = bytearray(416)
+    struct.pack_into("<IHHHHHHIHHIHH", out, 0, 0x6F676C70, 0, 0, 1, 1, 1, 1, 416, 0, 1, 0,
+                     0, 0)
+    out[0x20:0x40] = b"\xff" * 32
+    out[0x40:0x40 + 36] = content_id.encode("ascii")
+    struct.pack_into("<16I", out, 0xC0, 256, 32, 288, 2, 304, 9, 320, 16, 352, 32, 384, 2,
+                     400, 12, 336, 16)
+    struct.pack_into("<BBB", out, 0x100, 0x80, 0, 3)                 # chunk attrs
+    struct.pack_into("<HQII", out, 0x10E, 1, 0xFFFFFFFFFFFFFFFF, 0, 0)
+    struct.pack_into("<H", out, 0x120, 0)                            # chunk mchunks
+    out[0x130:0x138] = b"Chunk #0"                                   # chunk labels
+    struct.pack_into("<QQ", out, 0x140, 0, package_size)             # mchunk attrs
+    struct.pack_into("<QQ", out, 0x150, 0, inner_pfs_size)           # inner mchunk attrs
+    struct.pack_into("<B", out, 0x160, 1)                            # scenario attrs
+    struct.pack_into("<HHII", out, 0x174, 1, 1, 0, 0)
+    struct.pack_into("<H", out, 0x180, 0)                            # scenario chunks
+    out[0x190:0x19B] = b"Scenario #0"                                # scenario labels
+    return bytes(out)
+
+
+class Entry:
+    def __init__(self, id, name=None, data=b"", length=None, file=None):
+        self.id = id
+        self.name = name
+        self.data = data
+        self.file = file
+        self._length = length
+
+    @property
+    def length(self):
+        if self._length is not None:
+            return self._length
+        return len(self.data)
+
+
+class Meta:
+    def __init__(self, id, name_offset, flags1, flags2, data_offset, data_size):
+        self.id = id
+        self.name_offset = name_offset
+        self.flags1 = flags1
+        self.flags2 = flags2
+        self.data_offset = data_offset
+        self.data_size = data_size
+
+    def to_bytes(self):
+        return struct.pack(">6I8x", self.id, self.name_offset, self.flags1, self.flags2,
+                           self.data_offset, self.data_size)
+
+    @property
+    def encrypted(self):
+        return bool(self.flags1 & 0x80000000)
+
+    @property
+    def key_index(self):
+        return (self.flags2 & 0xF000) >> 12
+
+
+ENTRY_FLAGS1 = {
+    ENTRY_DIGESTS: 0x40000000,
+    ENTRY_ENTRY_KEYS: 0x60000000,
+    ENTRY_IMAGE_KEY: 0xE0000000,
+    ENTRY_GENERAL_DIGESTS: 0x60000000,
+    ENTRY_METAS: 0x60000000,
+    ENTRY_ENTRY_NAMES: 0x40000000,
+    ENTRY_LICENSE_DAT: 0x80000000,
+    ENTRY_LICENSE_INFO: 0x80000000,
+}
+
+ENTRY_FLAGS2 = {
+    ENTRY_IMAGE_KEY: 3 << 12,
+    ENTRY_LICENSE_DAT: 3 << 12,
+    ENTRY_LICENSE_INFO: 2 << 12,
+}
+
+GENERAL_DIGEST_CONTENT = 1 << 1
+GENERAL_DIGEST_GAME = 1 << 2
+GENERAL_DIGEST_HEADER = 1 << 3
+GENERAL_DIGEST_SYSTEM = 1 << 4
+GENERAL_DIGEST_MAJOR_PARAM = 1 << 5
+GENERAL_DIGEST_PARAM = 1 << 6
+
+
+class PkgHeader:
+    def __init__(self):
+        self.flags = 1
+        self.entry_count = 6
+        self.sc_entry_count = 6
+        self.entry_count_2 = 6
+        self.entry_table_offset = 0x2A80
+        self.main_ent_data_size = 0xD00
+        self.body_offset = 0x2000
+        self.body_size = 0x7E000
+        self.content_id = ""
+        self.drm_type = DRM_TYPE_PS4
+        self.content_type = 0
+        self.content_flags = 0
+        self.promote_size = 0
+        self.version_date = 0x20161020
+        self.version_hash = 0x1738551
+        self.iro_tag = 0
+        self.ekc_version = 1
+        self.sc_entries1_hash = bytes(32)
+        self.sc_entries2_hash = bytes(32)
+        self.digest_table_hash = bytes(32)
+        self.body_digest = bytes(32)
+        self.unk_0x400 = 1
+        self.pfs_image_count = 0
+        self.pfs_flags = 0
+        self.pfs_image_offset = 0
+        self.pfs_image_size = 0
+        self.mount_image_offset = 0
+        self.mount_image_size = 0
+        self.package_size = 0
+        self.pfs_signed_size = 0
+        self.pfs_cache_size = 0
+        self.pfs_image_digest = bytes(32)
+        self.pfs_signed_digest = bytes(32)
+        self.pfs_split_size_nth_0 = 0
+        self.pfs_split_size_nth_1 = 0
+
+    def to_bytes(self):
+        out = bytearray(0x490)
+        struct.pack_into(">4sIIIIHHIIQQ", out, 0, b"\x7fCNT", self.flags, 0, 0xF,
+                         self.entry_count, self.sc_entry_count, self.entry_count_2,
+                         self.entry_table_offset, self.main_ent_data_size, self.body_offset,
+                         self.body_size)
+        out[0x40:0x40 + len(self.content_id)] = self.content_id.encode("ascii")
+        struct.pack_into(">IIIIIIIIIIII", out, 0x70, self.drm_type, self.content_type,
+                         self.content_flags, self.promote_size, self.version_date,
+                         self.version_hash, 0, 0, 0, 0, self.iro_tag, self.ekc_version)
+        out[0x100:0x120] = self.sc_entries1_hash
+        out[0x120:0x140] = self.sc_entries2_hash
+        out[0x140:0x160] = self.digest_table_hash
+        out[0x160:0x180] = self.body_digest
+        struct.pack_into(">IIQQQQQQII", out, 0x400, self.unk_0x400, self.pfs_image_count,
+                         self.pfs_flags, self.pfs_image_offset, self.pfs_image_size,
+                         self.mount_image_offset, self.mount_image_size, self.package_size,
+                         self.pfs_signed_size, self.pfs_cache_size)
+        out[0x440:0x460] = self.pfs_image_digest
+        out[0x460:0x480] = self.pfs_signed_digest
+        struct.pack_into(">QQ", out, 0x480, self.pfs_split_size_nth_0,
+                         self.pfs_split_size_nth_1)
+        return bytes(out)
+
+
+###############################################################################
+# PKG builder
+###############################################################################
+
+def log_nothing(msg):
+    pass
+
+
+class PkgBuilder:
+    def __init__(self, proj, log=log_nothing):
+        self.proj = proj
+        self.log = log
+        self.content_id = proj.content_id
+        self.passcode = proj.passcode
+        self.volume_type = proj.volume_type
+        self.content_type = {"pkg_ps4_app": CONTENT_TYPE_GD,
+                             "pkg_ps4_ac_data": CONTENT_TYPE_AC,
+                             "pkg_ps4_ac_nodata": CONTENT_TYPE_AL}[proj.volume_type]
+        self.entitlement_key = None
+        if proj.entitlement_key is not None:
+            self.entitlement_key = from_hex_compact(proj.entitlement_key)
+        self.ekpfs = compute_key(self.content_id, self.passcode, 1)
+        self.file_time = proj.timestamp()
+        self.root = self.build_tree()
+
+    def build_tree(self):
+        root = FSDir("")
+
+        def get_or_add(parent, name):
+            d = parent.get_dir(name)
+            if d is None:
+                d = FSDir(name, parent)
+                parent.dirs.append(d)
+            return d
+
+        def add_dirs(parent, dirs):
+            for name, children in dirs:
+                d = parent
+                for part in name.split("/"):
+                    if part:
+                        d = get_or_add(d, part)
+                add_dirs(d, children)
+
+        add_dirs(root, self.proj.dirs)
+        for targ, orig in self.proj.files:
+            parts = targ.split("/")
+            parent = root
+            for part in parts[:-1]:
+                parent = get_or_add(parent, part)
+            parent.files.append(FSFile(parts[-1], parent, path=self.proj.source_path(orig)))
+        return root
+
+    def creation_info(self):
+        c_date = self.proj.c_date
+        now = datetime.now(timezone.utc)
+        if not c_date:
+            when, use_time = now, False
+        elif c_date == "actual_datetime":
+            when, use_time = now, True
+        else:
+            use_time = len(c_date.split(" ")) == 2
+            when = parse_datetime(c_date)
+            if use_time:
+                when = when.astimezone(timezone.utc)
+        info = "c_date=" + when.strftime("%Y%m%d")
+        if use_time:
+            info += ",c_time=" + when.strftime("%H%M%S")
+        return info
+
+    def build(self, output):
+        log = self.log
+        has_pfs = self.content_type != CONTENT_TYPE_AL
+        self.inner = self.outer = None
+        pfs_size = 0
+        if has_pfs:
+            if self.content_type == CONTENT_TYPE_GD and \
+               self.root.get_file("sce_sys/keystone") is None:
+                sce_sys = self.root.get_dir("sce_sys")
+                sce_sys.files.append(FSFile("keystone", sce_sys,
+                                            data=create_keystone(self.passcode)))
+            log("Preparing inner PFS...")
+            self.inner = PfsBuilder(self.root, self.file_time,
+                                    min_blocks=0x55 if self.content_type == CONTENT_TYPE_GD
+                                    else 0)
+            log("Preparing outer PFS...")
+            chunks, size, csize = pfsc_stream(self.inner)
+            outer_root = FSDir("")
+            outer_root.files.append(FSFile("pfs_image.dat", outer_root, chunks=chunks,
+                                           size=size, compressed_size=csize, compress=True))
+            self.outer = PfsBuilder(outer_root, self.file_time, sign=True, encrypt=True,
+                                    ekpfs=self.ekpfs, seed=bytes(16))
+            pfs_size = self.outer.size
+        log("Preparing PKG header and body...")
+        self.layout_pkg(pfs_size)
+
+        hdr = self.header
+        total = hdr.body_offset + hdr.body_size + hdr.pfs_image_size
+        with open(output, "w+b") as f:
+            f.truncate(total)
+            if has_pfs:
+                self.write_outer_pfs(f, hdr.pfs_image_offset)
+                log("Calculating SHA256 of finished outer PFS...")
+                hdr.pfs_signed_digest, hdr.pfs_image_digest = file_digests(
+                    f, hdr.pfs_image_offset, hdr.pfs_image_size, 0x10000)
+            self.finish_pkg(f)
+
+    def layout_pkg(self, pfs_size):
+        hdr = self.header = PkgHeader()
+        hdr.content_id = self.content_id
+        hdr.content_type = self.content_type
+        hdr.content_flags = CONTENT_FLAG_UNK_X8000000 | (
+            CONTENT_FLAG_GD_AC if self.content_type != CONTENT_TYPE_AL else 0)
+        if self.content_type != CONTENT_TYPE_AL:
+            hdr.pfs_image_count = 1
+            hdr.pfs_flags = 0x80000000000003CC
+            hdr.pfs_image_offset = 0x80000
+            hdr.pfs_image_size = pfs_size
+            hdr.package_size = 0x80000 + pfs_size
+            hdr.pfs_signed_size = 0x10000
+            hdr.pfs_cache_size = 0xD0000
+
+        sfo_file = self.root.get_file("sce_sys/param.sfo")
+        if sfo_file is None:
+            raise ValueError("Missing param.sfo!")
+        sfo = self.sfo = ParamSfo.parse(sfo_file.read_all())
+        info = self.creation_info()
+        if self.content_type != CONTENT_TYPE_AL:
+            info += (f",img0_l0_size={(hdr.package_size + 0xFFFFF) // (1024 * 1024)}"
+                     ",img0_l1_size=0,img0_sc_ksize=512,img0_pc_ksize=832")
+        sfo["PUBTOOLINFO"] = SfoValue("PUBTOOLINFO", SFO_UTF8, info, 0x200)
+        sfo["PUBTOOLVER"] = SfoValue("PUBTOOLVER", SFO_INTEGER, 0x02890000)
+        self.sfo_bytes = sfo.serialize()
+
+        ent = self.entries = {}
+        entries = [
+            Entry(ENTRY_ENTRY_KEYS, data=entry_keys_data(self.content_id, self.passcode)),
+            Entry(ENTRY_IMAGE_KEY, data=rsa2048_encrypt_key(FAKE_KEYSET_MODULUS, self.ekpfs)),
+            Entry(ENTRY_GENERAL_DIGESTS, length=0x180),
+            Entry(ENTRY_METAS),
+            Entry(ENTRY_DIGESTS),
+            Entry(ENTRY_ENTRY_NAMES),
+        ]
+        if self.content_type == CONTENT_TYPE_GD:
+            entries += [
+                Entry(ENTRY_PLAYGO_CHUNK_DAT, "playgo-chunk.dat", length=416),
+                Entry(ENTRY_PLAYGO_CHUNK_SHA, "playgo-chunk.sha"),
+                Entry(ENTRY_PLAYGO_MANIFEST_XML, "playgo-manifest.xml", PLAYGO_MANIFEST),
+            ]
+        entries += [
+            Entry(ENTRY_LICENSE_DAT, data=license_dat_data(self.content_id, self.content_type,
+                                                           self.entitlement_key)),
+            Entry(ENTRY_LICENSE_INFO, data=license_info_data(self.content_id,
+                                                             self.content_type,
+                                                             self.entitlement_key)),
+            Entry(ENTRY_PARAM_SFO, "param.sfo", self.sfo_bytes),
+            Entry(ENTRY_PSRESERVED_DAT, data=bytes(0x2000)),
+        ]
+        sce_sys = self.root.get_dir("sce_sys")
+        for f in sce_sys.all_files():
+            name = f.name
+            parent = f.parent
+            while parent is not None and parent is not self.root and parent.name != "sce_sys":
+                name = parent.name + "/" + name
+                parent = parent.parent
+            if name not in ENTRY_NAME_TO_ID or name == "param.sfo":
+                continue
+            eid = ENTRY_NAME_TO_ID[name]
+            entries.append(Entry(eid, ENTRY_ID_TO_NAME[eid], file=f, length=f.size))
+        for e in entries:
+            ent[e.id] = e
+        self.entry_list = entries
+        ent[ENTRY_DIGESTS].data = bytes(32 * len(entries))
+
+        # Name table, in sorted order
+        names = [""]
+        name_offsets = {"": 0}
+        length = 1
+        for e in sorted(entries, key=lambda e: collation_key(e.name)):
+            if e.name and e.name not in name_offsets:
+                names.append(e.name)
+                name_offsets[e.name] = length
+                length += len(e.name) + 1
+        ent[ENTRY_ENTRY_NAMES].data = b"".join(n.encode("ascii") + b"\0" for n in names)
+
+        # Entry table
+        metas = []
+        data_offset = hdr.body_offset
+        for e in entries:
+            m = Meta(e.id, name_offsets[e.name] if e.name else 0, ENTRY_FLAGS1.get(e.id, 0),
+                     ENTRY_FLAGS2.get(e.id, 0), data_offset, 0)
+            metas.append(m)
+            if e.id == ENTRY_METAS:
+                m.data_size = len(entries) * 32
+            elif e.id == ENTRY_PLAYGO_CHUNK_SHA:
+                # Estimate the PKG size, as LibOrbisPkg does
+                def cur_len(x):
+                    if x.id == ENTRY_METAS:
+                        return len(metas) * 32
+                    if x.id == ENTRY_PLAYGO_CHUNK_SHA:
+                        return 0
+                    return x.length
+                pkg_size = align(hdr.body_offset + sum(align(cur_len(x), 16) for x in entries),
+                                 0x80000) + pfs_size
+                pkg_size += ((pkg_size + 16) // 0x10000) * 4
+                m.data_size = (pkg_size // 0x10000) * 4
+            else:
+                m.data_size = e.length
+            data_offset = align(data_offset + m.data_size, 16)
+            e.meta = m
+        body_size = data_offset - hdr.body_offset
+        metas.sort(key=lambda m: m.id)
+        self.metas = metas
+        hdr.entry_count = len(entries)
+        hdr.entry_count_2 = len(entries)
+        hdr.body_size = align(hdr.body_offset + body_size, 0x80000) - hdr.body_offset
+        hdr.main_ent_data_size = (ent[ENTRY_ENTRY_KEYS].length + ent[ENTRY_IMAGE_KEY].length
+                                  + 0x180 + len(entries) * 32 + len(entries) * 32)
+        if self.content_type != CONTENT_TYPE_AL:
+            hdr.pfs_image_offset = hdr.body_offset + hdr.body_size
+            hdr.package_size = hdr.mount_image_size = (hdr.body_size + hdr.body_offset
+                                                       + hdr.pfs_image_size)
+        if self.content_type == CONTENT_TYPE_GD:
+            sha = ent[ENTRY_PLAYGO_CHUNK_SHA]
+            sha.data = bytearray(4 * (hdr.package_size // PLAYGO_CHUNK_SIZE))
+            if len(sha.data) > sha.meta.data_size:
+                raise ValueError("internal error: playgo-chunk.sha was not allocated "
+                                 "enough space")
+            sha.meta.data_size = len(sha.data)
+            ent[ENTRY_PLAYGO_CHUNK_DAT].data = playgo_chunk_dat(
+                self.content_id, hdr.package_size, self.inner.size)
+            hdr.promote_size = hdr.body_size + hdr.body_offset
+
+    def write_outer_pfs(self, f, pfs_offset):
+        '''Writes, signs and encrypts the outer PFS image, and hashes PlayGo chunks.'''
+        log = self.log
+        outer = self.outer
+        sign_key = pfs_crypto_key(self.ekpfs, outer.seed, 2)
+        enc_key = pfs_crypto_key(self.ekpfs, outer.seed, 1)
+        xts = XtsEncryptor(enc_key[16:32], enc_key[0:16])
+        chunk_sha = self.entries.get(ENTRY_PLAYGO_CHUNK_SHA)
+        chunk_base = pfs_offset // PLAYGO_CHUNK_SIZE
+
+        image_file = outer.root.files[0]
+        data_start = image_file.ino.start_block
+        reader = ChunkReader(outer.stream())
+        meta = bytearray(reader.read(data_start * BLOCK_SIZE))
+
+        def put_sig(buf, offset, block, data):
+            buf[offset:offset + 32] = hmac_sha256(sign_key, data)
+            struct.pack_into("<i", buf, offset + 32, block)
+
+        def encrypt_block(block, data):
+            if block == 0 or block == outer.empty_block:
+                return bytes(data)
+            sector = block * (BLOCK_SIZE // XTS_SECTOR_SIZE)
+            return b"".join(xts.encrypt_sector(data[i:i + XTS_SECTOR_SIZE], sector + k)
+                            for k, i in enumerate(range(0, BLOCK_SIZE, XTS_SECTOR_SIZE)))
+
+        def hash_chunk(block, data):
+            if chunk_sha is not None:
+                i = chunk_base + block
+                chunk_sha.data[4 * i:4 * i + 4] = sha256(data)[:4]
+
+        log("Writing, signing and encrypting the outer PFS...")
+        total_blocks = outer.ndblock
+        f.seek(pfs_offset + data_start * BLOCK_SIZE)
+        for first, count, sig_off in outer.data_sig_runs:
+            for k in range(count):
+                block = first + k
+                if block < data_start:
+                    data = bytes(meta[block * BLOCK_SIZE:(block + 1) * BLOCK_SIZE])
+                    put_sig(meta, sig_off + SIG_SIZE * k, block, data)
+                    continue
+                if f.tell() != pfs_offset + block * BLOCK_SIZE:
+                    raise ValueError("internal error: unexpected PFS data block order")
+                data = reader.read(BLOCK_SIZE)
+                if len(data) != BLOCK_SIZE:
+                    raise ValueError("internal error: short PFS image")
+                put_sig(meta, sig_off + SIG_SIZE * k, block, data)
+                data = encrypt_block(block, data)
+                hash_chunk(block, data)
+                f.write(data)
+        if reader.read(1):
+            raise ValueError("internal error: PFS image is larger than its layout")
+        if f.tell() != pfs_offset + total_blocks * BLOCK_SIZE:
+            raise ValueError("internal error: PFS image is smaller than its layout")
+
+        for block, sig_off, size in reversed(outer.final_sigs):
+            data = bytes(meta[block * BLOCK_SIZE:block * BLOCK_SIZE + size])
+            put_sig(meta, sig_off, block, data)
+
+        f.seek(pfs_offset)
+        for block in range(data_start):
+            data = encrypt_block(block, meta[block * BLOCK_SIZE:(block + 1) * BLOCK_SIZE])
+            hash_chunk(block, data)
+            f.write(data)
+
+    def general_digests(self):
+        hdr = self.header
+        sfo = self.sfo
+
+        def s(name):
+            v = sfo[name]
+            return "" if v is None else str(v)
+
+        major = "ATTRIBUTE" + s("ATTRIBUTE")
+        if sfo["ATTRIBUTE2"] is not None:
+            major += "ATTRIBUTE2" + s("ATTRIBUTE2")
+        major += "CATEGORY" + s("CATEGORY") + "FORMAT" + s("FORMAT") + \
+            "PUBTOOLVER" + s("PUBTOOLVER")
+        major_digest = sha256(major.encode("ascii", "replace"))
+
+        content = bytearray(self.content_id.encode("ascii")[:36].ljust(48, b"\0"))
+        content += struct.pack(">ii", hdr.drm_type, hdr.content_type)
+        if hdr.content_type in (CONTENT_TYPE_AC, CONTENT_TYPE_GD) or \
+           hdr.content_flags & CONTENT_FLAG_GD_AC:
+            content += hdr.pfs_image_digest
+        content += major_digest
+
+        raw = hdr.to_bytes()
+        digests = {
+            GENERAL_DIGEST_HEADER: sha256(raw[0:64], raw[0x400:0x480]),
+            GENERAL_DIGEST_CONTENT: sha256(bytes(content)),
+            GENERAL_DIGEST_MAJOR_PARAM: major_digest,
+            GENERAL_DIGEST_PARAM: sha256(self.sfo_bytes),
+        }
+        if hdr.content_type != CONTENT_TYPE_AL:
+            digests[GENERAL_DIGEST_GAME] = hdr.pfs_image_digest
+
+        out = bytearray(0x180)
+        struct.pack_into(">HH", out, 0, 0xD256, 0x100)
+        struct.pack_into(">i", out, 28, sum(digests))
+        for i, flag in enumerate((GENERAL_DIGEST_CONTENT, GENERAL_DIGEST_GAME,
+                                  GENERAL_DIGEST_HEADER, GENERAL_DIGEST_SYSTEM,
+                                  GENERAL_DIGEST_MAJOR_PARAM, GENERAL_DIGEST_PARAM)):
+            out[32 + 32 * i:64 + 32 * i] = digests.get(flag, bytes(32))
+        return bytes(out)
+
+    def finish_pkg(self, f):
+        hdr = self.header
+        ent = self.entries
+        ent[ENTRY_GENERAL_DIGESTS].data = self.general_digests()
+        ent[ENTRY_METAS].data = b"".join(m.to_bytes() for m in self.metas)
+
+        # Body
+        body = bytearray(hdr.body_offset + hdr.body_size)
+        for e in self.entry_list:
+            m = e.meta
+            data = e.file.read_all() if e.file is not None else bytes(e.data)
+            if len(data) != m.data_size:
+                raise ValueError(f"internal error: entry {e.id:#x} has the wrong size")
+            if m.encrypted:
+                iv_key = sha256(m.to_bytes(),
+                                compute_key(self.content_id, self.passcode, m.key_index))
+                data = aes128_cbc_encrypt(iv_key[16:32], iv_key[0:16], data)
+            body[m.data_offset:m.data_offset + len(data)] = data
+
+        digests_meta = ent[ENTRY_DIGESTS].meta
+        for i, m in enumerate(self.metas):
+            if i == 0:
+                continue
+            h = sha256(bytes(body[m.data_offset:m.data_offset + m.data_size]))
+            pos = digests_meta.data_offset + 32 * i
+            body[pos:pos + 32] = h
+        hdr.body_digest = sha256(bytes(body[hdr.body_offset:]))
+        dm = digests_meta
+        hdr.digest_table_hash = sha256(bytes(body[dm.data_offset:dm.data_offset + dm.data_size]))
+
+        def entry_bytes(eid, size=None):
+            m = ent[eid].meta
+            return bytes(body[m.data_offset:m.data_offset + (m.data_size if size is None
+                                                              else size)])
+        sc = [ENTRY_ENTRY_KEYS, ENTRY_IMAGE_KEY, ENTRY_GENERAL_DIGESTS, ENTRY_METAS]
+        sc1 = b"".join(entry_bytes(e) for e in sc + [ENTRY_DIGESTS])
+        if len(sc1) != hdr.main_ent_data_size:
+            raise ValueError("internal error: main_ent_data_size mismatch")
+        hdr.sc_entries1_hash = sha256(sc1)
+        hdr.sc_entries2_hash = sha256(b"".join(
+            entry_bytes(e, hdr.sc_entry_count * 0x20 if e == ENTRY_METAS else None)
+            for e in sc))
+
+        raw = hdr.to_bytes()
+        body[0:len(raw)] = raw
+        body[0xFE0:0x1000] = sha256(bytes(body[0:0xFE0]))
+        body[0x1000:0x1100] = rsa2048_encrypt_key(PKG_PUBLIC_KEYS[3], sha256(bytes(body[0:0x1000])))
+        f.seek(0)
+        f.write(body)
+
+
+def file_digests(f, offset, size, head_size):
+    '''SHA-256 of the first `head_size` bytes and of all `size` bytes at `offset`.'''
+    f.flush()
+    f.seek(offset)
+    whole = hashlib.sha256()
+    head = None
+    remaining = size
+    while remaining > 0:
+        buf = f.read(min(1 << 22, remaining))
+        if not buf:
+            raise IOError("unexpected end of the output file")
+        if head is None:
+            head = sha256(buf[:head_size])
+        whole.update(buf)
+        remaining -= len(buf)
+    return head, whole.digest()
+
+
+def from_hex_compact(text):
+    '''Hex string to bytes, skipping non-hex characters like LibOrbisPkg.'''
+    out = bytearray()
+    key = text.replace(" ", "")
+    x = 0
+    while x < len(key) - 1:
+        result = 0
+        for _ in range(2):
+            result = (result << 4) & 0xFF
+            c = key[x]
+            x += 1
+            if "0" <= c <= "9":
+                result |= ord(c) - ord("0")
+            elif "a" <= c <= "f":
+                result |= ord(c) - ord("a") + 10
+            elif "A" <= c <= "F":
+                result |= ord(c) - ord("A") + 10
+        out.append(result)
+    return bytes(out)
+
+
+###############################################################################
+# Command line
+###############################################################################
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.strip())
+    parser.add_argument("-o", "--output", metavar="PATH", type=str, default=".",
+                        help="write the PKG to PATH; if PATH is a directory, write "
+                        "CONTENT_ID.pkg in it (default: current directory)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="print progress messages")
+    parser.add_argument("project", metavar="PROJECT", type=str,
+                        help="the GP4 project file")
+    args = parser.parse_args()
+
+    def log(msg):
+        if args.verbose:
+            print(msg, file=sys.stderr)
+
+    try:
+        proj = Gp4Project(args.project)
+    except Gp4Error as e:
+        print(f"{parser.prog}: {e}", file=sys.stderr)
+        return 1
+
+    results = validate_project(proj)
+    if results:
+        print(f"Found {len(results)} issue(s) with GP4 project:", file=sys.stderr)
+    for is_fatal, msg in results:
+        print(f"{'FATAL ERROR' if is_fatal else 'WARNING    '}: {msg}", file=sys.stderr)
+    if any(is_fatal for is_fatal, _ in results):
+        print("Cannot build PKG due to fatal errors.", file=sys.stderr)
+        return 1
+
+    output = args.output
+    if os.path.isdir(output) or output.endswith(("/", os.sep)):
+        output = os.path.join(output, f"{proj.content_id}.pkg")
+
+    if Cipher is None:
+        log("Note: the python 'cryptography' package is not installed; "
+            "using a slower built-in AES implementation.")
+
+    try:
+        PkgBuilder(proj, log).build(output)
+    except BaseException as e:
+        try:
+            os.unlink(output)
+        except OSError:
+            pass
+        if isinstance(e, (OSError, ValueError, Gp4Error)):
+            print(f"{parser.prog}: {e}", file=sys.stderr)
+            return 1
+        raise
+    log(f"Wrote {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

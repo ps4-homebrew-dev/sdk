@@ -1,0 +1,110 @@
+OUTPUT_FORMAT("elf64-x86-64")
+OUTPUT_ARCH(i386:x86-64)
+
+/*
+ * Linker script for PS4 executables, used with ld.lld (see orbis-ld).
+ *
+ * The PS4 loader only knows three loadable segments: one executable text
+ * segment (code and read-only data), one PT_SCE_RELRO segment and one
+ * read-write data segment, each starting on a 16 KiB page and following each
+ * other without holes.  orbis-elf2self relies on the program headers below,
+ * in this order, and rewrites them into that form:
+ *
+ *   - `relro' becomes PT_SCE_RELRO;
+ *   - `meta' (the linker's own dynamic linking tables) is dropped, and
+ *     replaced by a PT_SCE_DYNLIBDATA segment that is not loaded;
+ *   - PT_DYNAMIC is pointed at the new dynamic table in PT_SCE_DYNLIBDATA;
+ *   - a PT_INTERP pointing at the start of .text is added.
+ */
+
+PHDRS {
+    text      PT_LOAD         FLAGS (0x5);
+    relro     PT_LOAD         FLAGS (0x4);
+    data      PT_LOAD         FLAGS (0x6);
+    procparam 0x61000001      FLAGS (0x4);
+    dynamic   PT_DYNAMIC      FLAGS (0x6);
+    tls       PT_TLS          FLAGS (0x4);
+    eh_frame  PT_GNU_EH_FRAME FLAGS (0x4);
+    meta      PT_LOAD         FLAGS (0x4);
+}
+
+SECTIONS {
+    .text 0 : ALIGN(CONSTANT(MAXPAGESIZE)) {
+        PROVIDE_HIDDEN(__image_base = .);
+        /* "/libexec/ld-elf.so.1", referred to by PT_INTERP */
+        QUAD(0x6365786562696c2f)
+        QUAD(0x2e666c652d646c2f)
+        QUAD(0x00000000312e6f73)
+        QUAD(0x0000000000000000)
+        *(.init)
+        *(.text .text.*)
+        *(.fini)
+        *(.plt .plt.*)
+    } : text
+
+    .rodata : { *(.rodata .rodata.*) } : text
+    .eh_frame_hdr : {
+        PROVIDE_HIDDEN(__eh_frame_hdr_start = .);
+        KEEP(*(.eh_frame_hdr))
+        PROVIDE_HIDDEN(__eh_frame_hdr_end = .);
+    } : text : eh_frame
+    .eh_frame : {
+        PROVIDE_HIDDEN(__eh_frame_start = .);
+        KEEP(*(.eh_frame))
+        PROVIDE_HIDDEN(__eh_frame_end = .);
+    } : text
+    .gcc_except_table : { *(.gcc_except_table .gcc_except_table.*) } : text
+    .dynstr : { *(.dynstr) } : text
+
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    .data.rel.ro : { *(.data.rel.ro .data.rel.ro.*) } : relro
+    .got : { *(.got) } : relro
+    .got.plt : { *(.got.plt) } : relro
+    .preinit_array : {
+        PROVIDE_HIDDEN(__preinit_array_start = .);
+        KEEP(*(.preinit_array))
+        PROVIDE_HIDDEN(__preinit_array_end = .);
+    } : relro
+    .init_array : {
+        PROVIDE_HIDDEN(__init_array_start = .);
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*)))
+        KEEP(*(.init_array .ctors))
+        PROVIDE_HIDDEN(__init_array_end = .);
+    } : relro
+    .fini_array : {
+        PROVIDE_HIDDEN(__fini_array_start = .);
+        KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*) SORT_BY_INIT_PRIORITY(.dtors.*)))
+        KEEP(*(.fini_array .dtors))
+        PROVIDE_HIDDEN(__fini_array_end = .);
+    } : relro
+
+    .sce_process_param : ALIGN(8) { KEEP(*(.sce_process_param)) } : relro : procparam
+
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    .dynamic : { *(.dynamic) } : data : dynamic
+    .data : { *(.data .data.*) } : data
+    /* Allow aligned vector loads from TLS */
+    .tdata : ALIGN(32) { *(.tdata .tdata.*) } : data : tls
+    .tbss : { *(.tbss .tbss.*) } : data : tls
+    .bss : {
+        *(.bss .bss.*)
+        *(COMMON)
+    } : data
+
+    /* Read by orbis-elf2self, not loaded */
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    .dynsym : { *(.dynsym) } : meta
+    .rela.dyn : { *(.rela.dyn) } : meta
+    .rela.plt : { *(.rela.plt) } : meta
+    .hash : { *(.hash) } : meta
+    .gnu.hash : { *(.gnu.hash) } : meta
+
+    /DISCARD/ : {
+        *(.interp)
+        *(.note.gnu.property)
+        *(.note.GNU-stack)
+        *(.note.ABI-tag)
+        *(.comment)
+        *(.note.gnu.build-id)
+    }
+}

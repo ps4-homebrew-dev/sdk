@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 John Törnblom
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3, or (at your option) any
+# later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; see the file COPYING. If not, see
+# <http://www.gnu.org/licenses/>.
+'''
+Generate a GP4 file for PlayStation 4 homebrew.
+'''
+
+import argparse
+import os
+import posixpath
+import string
+from datetime import datetime
+from xml.sax.saxutils import quoteattr
+
+
+tmpl = string.Template("""\
+<?xml version="1.0"?>
+<psproject xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           fmt="gp4" version="1000">
+  <volume>
+    <volume_type>pkg_ps4_app</volume_type>
+    <volume_id>PS4VOLUME</volume_id>
+    <volume_ts>${timestamp}</volume_ts>
+    <package content_id="${content_id}"
+             passcode="00000000000000000000000000000000"
+             storage_type="digital50" app_type="full" />
+    <chunk_info chunk_count="1" scenario_count="1">
+      <chunks>
+        <chunk id="0" layer_no="0" label="Chunk #0" />
+      </chunks>
+      <scenarios default_id="0">
+        <scenario id="0" type="sp" initial_chunk_count="1"
+                  label="Scenario #0">0</scenario>
+      </scenarios>
+    </chunk_info>
+  </volume>
+  <files img_no="0">
+    ${files}
+  </files>
+  <rootdir>
+    ${dirs}
+  </rootdir>
+</psproject>
+""")
+
+
+def normalize_path(path):
+    return path.replace("\\", "/")
+
+
+def filetag(filename):
+    if not filename:
+        return ""
+
+    filename = normalize_path(filename)
+
+    return (f"<file targ_path={quoteattr(filename)} "
+            f"orig_path={quoteattr(filename)} />")
+
+
+def dirtag(dirname):
+    if not dirname:
+        return ""
+
+    dirname = normalize_path(dirname)
+
+    return f"<dir targ_name={quoteattr(dirname)} />"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.strip())
+
+    parser.add_argument("-c", "--content-id", metavar="ID", type=str,
+                        required=True,
+                        help="assign the content id attribute to ID")
+
+    parser.add_argument("-o", "--output", metavar="PATH", type=str,
+                        default="/dev/stdout",
+                        help="output the GP4 file to PATH (default: /dev/stdout)")
+
+    parser.add_argument("files", metavar="FILE", type=str, nargs="+",
+                        help="include FILE in package")
+
+    args = parser.parse_args()
+
+    files = "\n    ".join(filter(None, (filetag(filename) for filename in args.files)))
+
+    directories = dict.fromkeys(posixpath.dirname(normalize_path(filename))
+                                for filename in args.files)
+
+    dirs = "\n    ".join(filter(None, (dirtag(dirname) for dirname in directories)))
+
+    result = tmpl.substitute(timestamp=datetime.now().isoformat(timespec="seconds"),
+                             content_id=args.content_id,
+                             dirs=dirs,
+                             files=files)
+
+    with open(args.output, "w", encoding="utf-8") as output:
+        output.write(result)
+        output.write("\n")
+
+
+if __name__ == "__main__":
+    main()
+

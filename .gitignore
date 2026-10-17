@@ -1,0 +1,11 @@
+*~
+*.o
+*.so
+*.a
+*.elf
+*.self
+*.prx
+*.sprx
+eboot.bin
+
+

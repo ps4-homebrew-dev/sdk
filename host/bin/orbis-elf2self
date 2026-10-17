@@ -1,0 +1,1384 @@
+#!/usr/bin/env python3
+
+import sys, os, struct, traceback
+import hashlib, hmac
+import argparse, re, string
+import base64, io
+from collections import namedtuple
+
+AUTH_INFO = "00 00 00 00 00 00 00 00 00 00 00 00 00 1C 00 40 00 FF 00 00 00 00"\
+            "00 80 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80"\
+            "00 40 00 40 00 00 00 00 00 00 00 80 00 00 00 00 00 00 00 08 00 40"\
+            "FF FF 00 00 00 F0 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"\
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"\
+            "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"\
+            "00 00 00 00"
+
+def int_with_base_type(val):
+	return int(val, 0)
+
+def try_parse_int(x, base=0):
+	try:
+		return int(x, base) if isinstance(x, str) else int(x)
+	except:
+		return None
+
+def align_up(x, alignment):
+	return (x + (alignment - 1)) & ~(alignment - 1)
+
+def align_down(x, alignment):
+	return x & ~(alignment - 1)
+
+def ilog2(x):
+	if x <= 0:
+		raise ValueError('math domain error')
+	return len(bin(x)) - 3
+
+def is_intervals_overlap(p1, p2):
+	return p1[0] <= p2[1] and p1[1] <= p2[0]
+
+def check_file_magic(f, expected_magic):
+	old_offset = f.tell()
+	try:
+		magic = f.read(len(expected_magic))
+	except:
+		return False
+	finally:
+		f.seek(old_offset)
+	return magic == expected_magic
+
+def parse_version(version):
+	major, minor, patch = (version >> 8) & 0xFF, version & 0xFF, 0 # FIXME
+	major = 10 * (major >> 4) + (major & 0xF)
+	minor = 10 * (minor >> 4) + (minor & 0xF)
+	return '{0:d}.{1:02d}.{2:03d}'.format(major, minor, patch)
+
+def sha256(data):
+	return hashlib.sha256(data).digest()
+
+def hmac_sha256(key, data):
+	return hmac.new(key=key, msg=data, digestmod=hashlib.sha256).digest()
+
+class ElfError(Exception):
+	def __init__(self, msg):
+		self.msg = msg
+
+	def __str__(self):
+		return repr(self.msg)
+
+class ElfEHdr(object):
+	FMT = '<4s5B6xB'
+	EX_FMT = '<2HI3QI6H'
+
+	MAGIC = b'\x7FELF'
+	CLASS64 = 0x2
+	DATA2LSB = 0x1
+	EM_X86_64 = 0x3E
+	EV_CURRENT = 0x1
+
+	ET_EXEC = 0x2
+	ET_SCE_EXEC = 0xFE00
+	ET_SCE_EXEC_ASLR = 0xFE10
+	ET_SCE_DYNAMIC = 0xFE18
+
+	def __init__(self):
+		self.magic = None
+		self.machine_class = None
+		self.data_encoding = None
+		self.version = None
+		self.os_abi = None
+		self.abi_version = None
+		self.nident_size = None
+		self.type = None
+		self.machine = None
+		self.version = None
+		self.entry = None
+		self.phoff = None
+		self.shoff = None
+		self.flags = None
+		self.ehsize = None
+		self.phentsize = None
+		self.phnum = None
+		self.shentsize = None
+		self.shnum = None
+		self.shstridx = None
+
+	def load(self, f):
+		if not check_file_magic(f, ElfEHdr.MAGIC):
+			raise ElfError('Invalid magic.')
+
+		self.magic, self.machine_class, self.data_encoding, self.version, self.os_abi, self.abi_version, self.nident_size = struct.unpack(ElfEHdr.FMT, f.read(struct.calcsize(ElfEHdr.FMT)))
+		if self.machine_class != ElfEHdr.CLASS64 or self.data_encoding != ElfEHdr.DATA2LSB:
+			raise ElfError('Unsupported class or data encoding.')
+		self.type, self.machine, self.version, self.entry, self.phoff, self.shoff, self.flags, self.ehsize, self.phentsize, self.phnum, self.shentsize, self.shnum, self.shstridx = struct.unpack(ElfEHdr.EX_FMT, f.read(struct.calcsize(ElfEHdr.EX_FMT)))
+		if self.machine != ElfEHdr.EM_X86_64 or self.version != ElfEHdr.EV_CURRENT:
+			raise ElfError('Unsupported machine type or version.')
+		if self.phentsize != struct.calcsize(ElfPHdr.FMT) or (self.shentsize > 0 and self.shentsize != struct.calcsize(ElfSHdr.FMT)):
+			raise ElfError('Unsupported header entry size.')
+		if self.type not in [ElfEHdr.ET_EXEC, ElfEHdr.ET_SCE_EXEC, ElfEHdr.ET_SCE_EXEC_ASLR, ElfEHdr.ET_SCE_DYNAMIC]:
+			raise ElfError('Unsupported type.')
+
+	def save(self, f):
+		f.write(struct.pack(ElfEHdr.FMT, self.magic, self.machine_class, self.data_encoding, self.version, self.os_abi, self.abi_version, self.nident_size))
+		f.write(struct.pack(ElfEHdr.EX_FMT, self.type, self.machine, self.version, self.entry, self.phoff, self.shoff, self.flags, self.ehsize, self.phentsize, self.phnum, self.shentsize, self.shnum, self.shstridx))
+
+	def has_segments(self):
+		return self.phentsize > 0 and self.phnum > 0
+
+	def has_sections(self):
+		return self.shentsize > 0 and self.shnum > 0
+
+class ElfPHdr(object):
+	FMT = '<2I6Q'
+
+	PT_LOAD = 0x1
+	PT_DYNAMIC = 0x2
+	PT_INTERP = 0x3
+	PT_TLS = 0x7
+	PT_GNU_EH_FRAME = 0x6474E550
+	PT_GNU_STACK = 0x6474E551
+	PT_SCE_RELA = 0x60000000,
+	PT_SCE_DYNLIBDATA = 0x61000000
+	PT_SCE_PROCPARAM = 0x61000001
+	PT_SCE_MODULE_PARAM = 0x61000002
+	PT_SCE_RELRO = 0x61000010
+	PT_SCE_COMMENT = 0x6FFFFF00
+	PT_SCE_VERSION = 0x6FFFFF01
+
+	PF_EXEC = 0x1
+	PF_WRITE = 0x2
+	PF_READ = 0x4
+	PF_READ_EXEC = PF_READ | PF_EXEC
+	PF_READ_WRITE = PF_READ | PF_WRITE
+
+	def __init__(self, idx):
+		self.idx = idx
+		self.type = None
+		self.flags = None
+		self.offset = None
+		self.vaddr = None
+		self.paddr = None
+		self.filesz = None
+		self.memsz = None
+		self.align = None
+
+	def load(self, f):
+		self.type, self.flags, self.offset, self.vaddr, self.paddr, self.filesz, self.memsz, self.align = struct.unpack(ElfPHdr.FMT, f.read(struct.calcsize(ElfPHdr.FMT)))
+
+	def save(self, f):
+		f.write(struct.pack(ElfPHdr.FMT, self.type, self.flags, self.offset, self.vaddr, self.paddr, self.filesz, self.memsz, self.align))
+
+	def name(self):
+		if self.type == ElfPHdr.PT_LOAD:
+			if (self.flags & ElfPHdr.PF_READ_EXEC) == ElfPHdr.PF_READ_EXEC:
+				return '.text'
+			elif (self.flags & ElfPHdr.PF_READ_WRITE) == ElfPHdr.PF_READ_WRITE:
+				return '.data'
+			else:
+				return '.load_{0:02}'.format(self.idx)
+		else:
+			return {
+				ElfPHdr.PT_DYNAMIC: '.dynamic',
+				ElfPHdr.PT_INTERP: '.interp',
+				ElfPHdr.PT_TLS: '.tls',
+				ElfPHdr.PT_GNU_EH_FRAME: '.eh_frame_hdr',
+				ElfPHdr.PT_SCE_DYNLIBDATA: '.sce_dynlib_data',
+				ElfPHdr.PT_SCE_PROCPARAM: '.sce_process_param',
+				ElfPHdr.PT_SCE_MODULE_PARAM: '.sce_module_param',
+				ElfPHdr.PT_SCE_COMMENT: '.sce_comment',
+			}.get(self.type, None)
+
+	def class_name(self):
+		if (self.flags & ElfPHdr.PF_READ_EXEC) == ElfPHdr.PF_READ_EXEC:
+			return 'CODE'
+		else:
+			return 'DATA'
+
+class ElfSHdr(object):
+	FMT = '<2I4Q2I2Q'
+
+	def __init__(self, idx):
+		self.idx = idx
+		self.name = None
+		self.type = None
+		self.flags = None
+		self.addr = None
+		self.offset = None
+		self.size = None
+		self.link = None
+		self.info = None
+		self.align = None
+		self.entsize = None
+
+	def load(self, f):
+		self.name, self.type, self.flags, self.addr, self.offset, self.size, self.link, self.info, self.align, self.entsize = struct.unpack(ElfSHdr.FMT, f.read(struct.calcsize(ElfSHdr.FMT)))
+
+	def save(self, f):
+		f.write(struct.pack(ElfSHdr.FMT, self.name, self.type, self.flags, self.addr, self.offset, self.size, self.link, self.info, self.align, self.entsize))
+
+class ElfFile(object):
+	def __init__(self, **kwargs):
+		self.ehdr = None
+		self.phdrs = None
+		self.shdrs = None
+		self.file_size = None
+		self.digest = None
+		self.segments = None
+		self.sections = None
+		self.ignore_shdrs = 'ignore_shdrs' in kwargs and kwargs['ignore_shdrs']
+
+	def load(self, f):
+		start_offset = f.tell()
+		data = f.read()
+		self.file_size = len(data)
+		self.digest = sha256(data)
+		f.seek(start_offset)
+
+		self.ehdr = ElfEHdr()
+		self.ehdr.load(f)
+
+		if self.ignore_shdrs:
+			self.ehdr.shnum = 0
+
+		self.phdrs = []
+		self.segments = []
+		if self.ehdr.has_segments():
+			for i in range(self.ehdr.phnum):
+				f.seek(start_offset + self.ehdr.phoff + i * self.ehdr.phentsize)
+				phdr = ElfPHdr(i)
+				phdr.load(f)
+				self.phdrs.append(phdr)
+				if phdr.filesz > 0:
+					f.seek(start_offset + phdr.offset)
+					data = f.read(phdr.filesz)
+				else:
+					data = b''
+				self.segments.append(data)
+
+		self.shdrs = []
+		self.sections = []
+		if self.ehdr.has_sections():
+			for i in range(self.ehdr.shnum):
+				f.seek(start_offset + self.ehdr.shoff + i * self.ehdr.shentsize)
+				shdr = ElfSHdr(i)
+				shdr.load(f)
+				self.shdrs.append(shdr)
+				if phdr.filesz > 0:
+					f.seek(start_offset + shdr.offset)
+					data = f.read(phdr.filesz)
+				else:
+					data = b''
+				self.sections.append(data)
+
+	def save(self, f, no_sections=False):
+		start_offset = f.tell()
+
+		self.ehdr.save(f)
+
+		if not no_sections:
+			if self.ehdr.has_sections():
+				for i in range(self.ehdr.shnum):
+					f.seek(start_offset + self.ehdr.shoff + i * self.ehdr.shentsize)
+					shdr = self.shdrs[i]
+					shdr.save(f)
+
+		if self.ehdr.has_segments():
+			for i in range(self.ehdr.phnum):
+				f.seek(start_offset + self.ehdr.phoff + i * self.ehdr.phentsize)
+				phdr = self.phdrs[i]
+				phdr.save(f)
+
+DIGEST_SIZE = 0x20
+SIGNATURE_SIZE = 0x100
+BLOCK_SIZE = 0x4000
+DEFAULT_BLOCK_SIZE = 0x1000
+
+SELF_CONTROL_BLOCK_TYPE_NPDRM = 0x3
+SELF_NPDRM_CONTROL_BLOCK_CONTENT_ID_SIZE = 0x13
+SELF_NPDRM_CONTROL_BLOCK_RANDOM_PAD_SIZE = 0xD
+
+EMPTY_DIGEST = b'\0' * DIGEST_SIZE
+EMPTY_SIGNATURE = b'\0' * SIGNATURE_SIZE
+
+class SignedElfEntry(object):
+	FMT = '<4Q'
+
+	PROPS_ORDER_SHIFT = 0
+	PROPS_ORDER_MASK = 0x1
+	PROPS_ENCRYPTED_SHIFT = 1
+	PROPS_ENCRYPTED_MASK = 0x1
+	PROPS_SIGNED_SHIFT = 2
+	PROPS_SIGNED_MASK = 0x1
+	PROPS_COMPRESSED_SHIFT = 3
+	PROPS_COMPRESSED_MASK = 0x1
+	PROPS_WINDOW_BITS_SHIFT = 8
+	PROPS_WINDOW_BITS_MASK = 0x7
+	PROPS_HAS_BLOCKS_SHIFT = 11
+	PROPS_HAS_BLOCKS_MASK = 0x1
+	PROPS_BLOCK_SIZE_SHIFT = 12
+	PROPS_BLOCK_SIZE_MASK = 0xF
+	PROPS_HAS_DIGESTS_SHIFT = 16
+	PROPS_HAS_DIGESTS_MASK = 0x1
+	PROPS_HAS_EXTENTS_SHIFT = 17
+	PROPS_HAS_EXTENTS_MASK = 0x1
+	PROPS_HAS_META_SEGMENT_SHIFT = 20
+	PROPS_HAS_META_SEGMENT_MASK = 0x1
+	PROPS_SEGMENT_INDEX_SHIFT = 20
+	PROPS_SEGMENT_INDEX_MASK = 0xFFFF
+	PROPS_DEFAULT_BLOCK_SIZE = 0x1000
+	PROPS_META_SEGMENT_MASK = 0xF0000
+
+	def __init__(self, index):
+		self.index = index
+
+		self.props = None
+		self.offset = None
+		self.filesz = None
+		self.memsz = None
+
+		self.data = None
+
+	def save(self, f):
+		f.write(struct.pack(SignedElfEntry.FMT, self.props, self.offset, self.filesz, self.memsz))
+
+	@property
+	def order(self):
+		return (self.props >> SignedElfEntry.PROPS_ORDER_SHIFT) & SignedElfEntry.PROPS_ORDER_MASK
+
+	@order.setter
+	def order(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_ORDER_MASK << SignedElfEntry.PROPS_ORDER_SHIFT)
+		self.props |= (value & SignedElfEntry.PROPS_ORDER_MASK) << SignedElfEntry.PROPS_ORDER_SHIFT
+
+	@property
+	def encrypted(self):
+		return ((self.props >> SignedElfEntry.PROPS_ENCRYPTED_SHIFT) & SignedElfEntry.PROPS_ENCRYPTED_MASK) != 0
+
+	@encrypted.setter
+	def encrypted(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_ENCRYPTED_MASK << SignedElfEntry.PROPS_ENCRYPTED_SHIFT)
+		if value:
+			self.props |= SignedElfEntry.PROPS_ENCRYPTED_MASK << SignedElfEntry.PROPS_ENCRYPTED_SHIFT
+
+	@property
+	def signed(self):
+		return ((self.props >> SignedElfEntry.PROPS_SIGNED_SHIFT) & SignedElfEntry.PROPS_SIGNED_MASK) != 0
+
+	@signed.setter
+	def signed(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_SIGNED_MASK << SignedElfEntry.PROPS_SIGNED_SHIFT)
+		if value:
+			self.props |= SignedElfEntry.PROPS_SIGNED_MASK << SignedElfEntry.PROPS_SIGNED_SHIFT
+
+	@property
+	def compressed(self):
+		return ((self.props >> SignedElfEntry.PROPS_COMPRESSED_SHIFT) & SignedElfEntry.PROPS_COMPRESSED_MASK) != 0
+
+	@compressed.setter
+	def compressed(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_COMPRESSED_MASK << SignedElfEntry.PROPS_COMPRESSED_SHIFT)
+		if value:
+			self.props |= SignedElfEntry.PROPS_COMPRESSED_MASK << SignedElfEntry.PROPS_COMPRESSED_SHIFT
+
+	@property
+	def has_blocks(self):
+		return ((self.props >> SignedElfEntry.PROPS_HAS_BLOCKS_SHIFT) & SignedElfEntry.PROPS_HAS_BLOCKS_MASK) != 0
+
+	@has_blocks.setter
+	def has_blocks(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_HAS_BLOCKS_MASK << SignedElfEntry.PROPS_HAS_BLOCKS_SHIFT)
+		if value:
+			self.props |= SignedElfEntry.PROPS_HAS_BLOCKS_MASK << SignedElfEntry.PROPS_HAS_BLOCKS_SHIFT
+
+	@property
+	def has_digests(self):
+		return ((self.props >> SignedElfEntry.PROPS_HAS_DIGESTS_SHIFT) & SignedElfEntry.PROPS_HAS_DIGESTS_MASK) != 0
+
+	@has_digests.setter
+	def has_digests(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_HAS_DIGESTS_MASK << SignedElfEntry.PROPS_HAS_DIGESTS_SHIFT)
+		if value:
+			self.props |= SignedElfEntry.PROPS_HAS_DIGESTS_MASK << SignedElfEntry.PROPS_HAS_DIGESTS_SHIFT
+
+	@property
+	def has_extents(self):
+		return ((self.props >> SignedElfEntry.PROPS_HAS_EXTENTS_SHIFT) & SignedElfEntry.PROPS_HAS_EXTENTS_MASK) != 0
+
+	@has_extents.setter
+	def has_extents(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_HAS_EXTENTS_MASK << SignedElfEntry.PROPS_HAS_EXTENTS_SHIFT)
+		if value:
+			self.props |= SignedElfEntry.PROPS_HAS_EXTENTS_MASK << SignedElfEntry.PROPS_HAS_EXTENTS_SHIFT
+
+	@property
+	def has_meta_segment(self):
+		return ((self.props >> SignedElfEntry.PROPS_HAS_META_SEGMENT_SHIFT) & SignedElfEntry.PROPS_HAS_META_SEGMENT_MASK) != 0
+
+	@has_meta_segment.setter
+	def has_meta_segment(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_HAS_META_SEGMENT_MASK << SignedElfEntry.PROPS_HAS_META_SEGMENT_SHIFT)
+		if value:
+			self.props |= SignedElfEntry.PROPS_HAS_META_SEGMENT_MASK << SignedElfEntry.PROPS_HAS_META_SEGMENT_SHIFT
+
+	@property
+	def wbits(self):
+		return (self.props >> SignedElfEntry.PROPS_WINDOW_BITS_SHIFT) & SignedElfEntry.PROPS_WINDOW_BITS_MASK
+
+	@wbits.setter
+	def wbits(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_WINDOW_BITS_MASK << SignedElfEntry.PROPS_WINDOW_BITS_SHIFT)
+		self.props |= (value & SignedElfEntry.PROPS_WINDOW_BITS_MASK) << SignedElfEntry.PROPS_WINDOW_BITS_SHIFT
+
+	@property
+	def block_size(self):
+		if self.has_blocks:
+			return 1 << (12 + (self.props >> SignedElfEntry.PROPS_BLOCK_SIZE_SHIFT) & SignedElfEntry.PROPS_BLOCK_SIZE_MASK)
+		else:
+			return DEFAULT_BLOCK_SIZE
+
+	@block_size.setter
+	def block_size(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_BLOCK_SIZE_MASK << SignedElfEntry.PROPS_BLOCK_SIZE_SHIFT)
+		if self.has_blocks:
+			value = ilog2(value) - 12
+		else:
+			value = 0 # TODO: check
+		self.props |= (value & SignedElfEntry.PROPS_BLOCK_SIZE_MASK) << SignedElfEntry.PROPS_BLOCK_SIZE_SHIFT
+
+	@property
+	def segment_index(self):
+		return (self.props >> SignedElfEntry.PROPS_SEGMENT_INDEX_SHIFT) & SignedElfEntry.PROPS_SEGMENT_INDEX_MASK
+
+	@wbits.setter
+	def segment_index(self, value):
+		self.props &= ~(SignedElfEntry.PROPS_SEGMENT_INDEX_MASK << SignedElfEntry.PROPS_SEGMENT_INDEX_SHIFT)
+		self.props |= (value & SignedElfEntry.PROPS_SEGMENT_INDEX_MASK) << SignedElfEntry.PROPS_SEGMENT_INDEX_SHIFT
+
+	def is_meta_segment(self): # TODO: check
+		return (self.props & SignedElfEntry.PROPS_META_SEGMENT_MASK) != 0
+
+	def __repr__(self):
+		return 'prs:0x{0:X} ofs:0x{1:X} fsz:0x{2:X} msz:0x{3:X}'.format(self.props, self.offset, self.filesz, self.memsz)
+
+class SignedElfExInfo(object):
+	FMT = '<4Q32s'
+
+	PTYPE_FAKE = 0x1
+	PTYPE_NPDRM_EXEC = 0x4
+	PTYPE_NPDRM_DYNLIB = 0x5
+	PTYPE_SYSTEM_EXEC = 0x8
+	PTYPE_SYSTEM_DYNLIB = 0x9 # including Mono binaries
+	PTYPE_HOST_KERNEL = 0xC
+	PTYPE_SECURE_MODULE = 0xE
+	PTYPE_SECURE_KERNEL = 0xF
+
+	def __init__(self):
+		self.paid = None
+		self.ptype = None
+		self.app_version = None
+		self.fw_version = None
+		self.digest = None
+
+	def save(self, f):
+		f.write(struct.pack(SignedElfExInfo.FMT, self.paid, self.ptype, self.app_version, self.fw_version, self.digest))
+
+class SignedElfNpdrmControlBlock(object):
+	FMT = '<H14x19s13s'
+
+	def __init__(self):
+		self.type = SELF_CONTROL_BLOCK_TYPE_NPDRM
+		self.content_id = None
+		self.random_pad = None
+
+	def save(self, f):
+		f.write(struct.pack(SignedElfNpdrmControlBlock.FMT, self.type, self.content_id, self.random_pad))
+
+class SignedElfMetaBlock(object):
+	FMT = '<80x'
+
+	def __init__(self):
+		pass
+
+	def save(self, f):
+		f.write(struct.pack(SignedElfMetaBlock.FMT))
+
+class SignedElfMetaFooter(object):
+	FMT = '<48xI28x'
+
+	def __init__(self):
+		self.unk1 = None
+
+	def save(self, f):
+		f.write(struct.pack(SignedElfMetaFooter.FMT, self.unk1))
+
+class SignedElfFile(object):
+	COMMON_HEADER_FMT = '<4s4B'
+	EXT_HEADER_FMT = '<I2HQ2H4x'
+
+	MAGIC = b'\x4F\x15\x3D\x1D'
+	VERSION = 0x00
+	MODE = 0x01
+	ENDIAN = 0x01
+	ATTRIBS = 0x12
+
+	KEY_TYPE = 0x101
+
+	FLAGS_SEGMENT_SIGNED_SHIFT = 4
+	FLAGS_SEGMENT_SIGNED_MASK = 0x7
+
+	HAS_NPDRM = 1
+
+	def __init__(self, elf, **kwargs):
+		self.elf = elf
+
+		self.magic = None
+		self.version = None
+		self.mode = None
+		self.endian = None
+		self.attribs = None
+		self.key_type = None
+		self.header_size = None
+		self.meta_size = None
+		self.file_size = None
+		self.num_entries = None
+		self.flags = None
+
+		self.entries = None
+		self.ex_info = None
+		self.npdrm_control_block = None
+		self.meta_blocks = None
+		self.meta_footer = None
+		self.signature = None
+		self.version_data = None
+
+		self.paid = kwargs['paid'] if 'paid' in kwargs and not kwargs['paid'] is None else 0x3100000000000002
+		self.ptype = kwargs['ptype'] if 'ptype' in kwargs and not kwargs['ptype'] is None else SignedElfExInfo.PTYPE_FAKE
+		self.app_version = kwargs['app_version'] if 'app_version' in kwargs and not kwargs['app_version'] is None else 0
+		self.fw_version = kwargs['fw_version'] if 'fw_version' in kwargs and not kwargs['fw_version'] is None else 0
+		self.auth_info = kwargs['auth_info'] if 'auth_info' in kwargs and not kwargs['auth_info'] is None else None
+
+	def _prepare(self):
+		self.magic = SignedElfFile.MAGIC
+		self.version = SignedElfFile.VERSION
+		self.mode = SignedElfFile.MODE
+		self.endian = SignedElfFile.ENDIAN
+		self.attribs = SignedElfFile.ATTRIBS
+		self.key_type = SignedElfFile.KEY_TYPE
+		self.flags = 0x2
+
+		signed_block_count = 2
+		self.flags |= (signed_block_count & SignedElfFile.FLAGS_SEGMENT_SIGNED_MASK) << SignedElfFile.FLAGS_SEGMENT_SIGNED_SHIFT
+
+		self.entries = []
+		entry_idx = 0
+		for i in range(self.elf.ehdr.phnum):
+			phdr = self.elf.phdrs[i]
+			if phdr.type == ElfPHdr.PT_SCE_VERSION:
+				self.version_data = self.elf.segments[i]
+			if not phdr.type in [ElfPHdr.PT_LOAD, ElfPHdr.PT_SCE_RELRO, ElfPHdr.PT_SCE_DYNLIBDATA, ElfPHdr.PT_SCE_COMMENT]:
+				continue
+			meta_entry = SignedElfEntry(entry_idx)
+			meta_entry.props = 0
+			meta_entry.encrypted = False
+			meta_entry.signed = True
+			meta_entry.has_digests = True
+			meta_entry.segment_index = entry_idx + 1
+			self.entries.append(meta_entry)
+			data_entry = SignedElfEntry(entry_idx + 1)
+			data_entry.props = 0
+			data_entry.encrypted = False
+			data_entry.signed = True
+			data_entry.has_blocks = True
+			data_entry.block_size = BLOCK_SIZE
+			data_entry.segment_index = i
+			self.entries.append(data_entry)
+			entry_idx += 2
+		self.num_entries = len(self.entries)
+
+		self.ex_info = SignedElfExInfo()
+		self.ex_info.paid = self.paid
+		self.ex_info.ptype = self.ptype
+		self.ex_info.app_version = self.app_version
+		self.ex_info.fw_version = self.fw_version
+		self.ex_info.digest = self.elf.digest
+
+		if SignedElfFile.HAS_NPDRM:
+			self.npdrm_control_block = SignedElfNpdrmControlBlock()
+			self.npdrm_control_block.content_id = b'\0' * SELF_NPDRM_CONTROL_BLOCK_CONTENT_ID_SIZE
+			self.npdrm_control_block.random_pad = b'\0' * SELF_NPDRM_CONTROL_BLOCK_RANDOM_PAD_SIZE
+
+		self.header_size = struct.calcsize(SignedElfFile.COMMON_HEADER_FMT) + struct.calcsize(SignedElfFile.EXT_HEADER_FMT)
+		self.header_size += self.num_entries * struct.calcsize(SignedElfEntry.FMT)
+		self.header_size += max(self.elf.ehdr.ehsize, self.elf.ehdr.phoff + self.elf.ehdr.phentsize * self.elf.ehdr.phnum)
+		self.header_size = align_up(self.header_size, 16)
+		self.header_size += struct.calcsize(SignedElfExInfo.FMT)
+		if SignedElfFile.HAS_NPDRM:
+			self.header_size += struct.calcsize(SignedElfNpdrmControlBlock.FMT)
+		self.meta_size = self.num_entries * struct.calcsize(SignedElfMetaBlock.FMT) + struct.calcsize(SignedElfMetaFooter.FMT) + SIGNATURE_SIZE
+		#print("meta block", self.num_entries, self.num_entries * struct.calcsize(SignedElfMetaBlock.FMT));
+		#print("footer", struct.calcsize(SignedElfMetaFooter.FMT));
+		#print("signature",SIGNATURE_SIZE);
+
+		self.meta_blocks = []
+		for i in range(self.num_entries):
+			meta_block = SignedElfMetaBlock()
+			self.meta_blocks.append(meta_block)
+
+		self.meta_footer = SignedElfMetaFooter()
+		self.meta_footer.unk1 = 0x10000
+
+		if not self.auth_info is None:
+			self.signature = (struct.pack('<QQ', len(self.auth_info), self.ex_info.paid) + self.auth_info[8:]).ljust(SIGNATURE_SIZE, b'\0')
+		else:
+			self.signature = EMPTY_SIGNATURE
+
+		entry_idx = 0
+		offset = self.header_size + self.meta_size
+		for i in range(self.elf.ehdr.phnum):
+			phdr = self.elf.phdrs[i]
+			if not phdr.type in [ElfPHdr.PT_LOAD, ElfPHdr.PT_SCE_RELRO, ElfPHdr.PT_SCE_DYNLIBDATA, ElfPHdr.PT_SCE_COMMENT]:
+				continue
+			#print('processing segment #{0:02}...'.format(i))
+
+			meta_entry, data_entry = self.entries[entry_idx], self.entries[entry_idx + 1]
+
+			num_blocks = align_up(phdr.filesz, BLOCK_SIZE) // BLOCK_SIZE
+			meta_entry.data = EMPTY_DIGEST * num_blocks
+			meta_entry.offset = offset
+			meta_entry.memsz = meta_entry.filesz = len(meta_entry.data)
+			offset += meta_entry.filesz
+			offset = align_up(offset, 16)
+
+			data_entry.data = self.elf.segments[i]
+			data_entry.offset = offset
+			data_entry.memsz = data_entry.filesz = phdr.filesz
+			offset += data_entry.filesz
+			offset = align_up(offset, 16)
+
+			entry_idx += 2
+
+		self.file_size = offset
+
+	def save(self, f):
+		start_offset = f.tell()
+
+		# calculate neccessary fields
+		self._prepare()
+
+		# write common header
+		f.write(struct.pack(SignedElfFile.COMMON_HEADER_FMT, self.magic, self.version, self.mode, self.endian, self.attribs))
+
+		# write extended header
+		f.write(struct.pack(SignedElfFile.EXT_HEADER_FMT, self.key_type, self.header_size, self.meta_size, self.file_size, self.num_entries, self.flags))
+
+		# write entries
+		for entry in self.entries:
+			entry.save(f)
+
+		# write elf headers
+		elf_offset = f.tell()
+		elf_header_size = max(self.elf.ehdr.ehsize, self.elf.ehdr.phoff + self.elf.ehdr.phentsize * self.elf.ehdr.phnum)
+		elf_header_size = align_up(elf_header_size, 16)
+		self.elf.save(f, True)
+		f.seek(elf_offset + elf_header_size)
+
+		# write extended info
+		self.ex_info.save(f)
+
+		# write npdrm control block
+		if SignedElfFile.HAS_NPDRM:
+			self.npdrm_control_block.save(f)
+
+		# write meta blocks
+		for meta_block in self.meta_blocks:
+			meta_block.save(f)
+
+		# write meta footer
+		self.meta_footer.save(f)
+
+		# write signature
+		f.write(self.signature)
+
+		# write segments
+		for entry in self.entries:
+			f.seek(start_offset + entry.offset)
+			f.write(entry.data)
+
+		if f.tell() < self.file_size:
+			f.seek(self.file_size-1)
+			f.write(b"\x00")
+
+		# write version
+		if not self.version_data is None:
+			f.write(self.version_data)
+
+# ===========================================================================
+# Converting a linked ELF into the PS4's format
+#
+# orbis-ld (plain ld.lld) produces an ordinary ELF file.  If it was linked
+# with main.script (a PT_SCE_PROCPARAM program header) or prx.script (a
+# PT_SCE_MODULE_PARAM one), it is first rewritten into the form the PS4
+# loader expects, then signed.  The format is the one of the official SDK,
+# as also produced by OpenOrbis' create-fself:
+#
+#   - three loadable segments, each starting on a 16 KiB page and following
+#     each other without holes: text (code and read-only data), PT_SCE_RELRO
+#     and data;
+#   - the dynamic linking information (string, symbol, relocation and hash
+#     tables, and the dynamic table) is in a PT_SCE_DYNLIBDATA segment at
+#     the end of the file, which is not loaded.  The dynamic table uses the
+#     DT_SCE_* tags, whose values are offsets into that segment rather than
+#     addresses, and PT_DYNAMIC points at it in the file;
+#   - an executable has a PT_INTERP, pointing at "/libexec/ld-elf.so.1" at
+#     the start of .text (put there by main.script).
+#
+# Imports are resolved against the stub libraries: the module needed as X.sprx
+# is described by the stub X.so (or a file named exactly like the soname),
+# looked up in the -L directories, the input file's directory and the SDK.
+# Each needed module X is imported as one library, also named X.  A shared
+# object exports its defined dynamic symbols in one library named after the
+# module: X, from its soname or else from the output file name (X.sprx).
+#
+# An executable exports the symbols only it defines (all of them, when linked
+# with -rdynamic) in one library, "eboot", named after its module.  A shared
+# object converted with --main FILE, FILE being that executable as linked,
+# imports from it first, as a dynamic linker resolves a shared object's
+# references to an executable's symbols before its libraries' and its own.
+# ===========================================================================
+
+PAGE = 0x4000
+
+Phdr = namedtuple("Phdr", "type flags offset vaddr paddr filesz memsz align")
+PHDR_FMT = "<IIQQQQQQ"
+SYM_FMT = "<IBBHQQ"
+PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_TLS = 1, 2, 3, 7
+PT_GNU_EH_FRAME = 0x6474E550
+PT_SCE_DYNLIBDATA, PT_SCE_PROCPARAM, PT_SCE_MODULE_PARAM = 0x61000000, 0x61000001, 0x61000002
+PT_SCE_RELRO = 0x61000010
+PF_X, PF_W, PF_R = 1, 2, 4
+
+DT_NULL, DT_NEEDED, DT_PLTGOT, DT_INIT, DT_FINI, DT_SONAME = 0, 1, 3, 12, 13, 14
+DT_RELA, DT_DEBUG, DT_TEXTREL, DT_FLAGS = 7, 21, 22, 30
+DF_TEXTREL = 0x4
+DT_SCE_FINGERPRINT = 0x61000007
+DT_SCE_ORIGINAL_FILENAME = 0x61000009
+DT_SCE_MODULE_INFO = 0x6100000D
+DT_SCE_NEEDED_MODULE = 0x6100000F
+DT_SCE_MODULE_ATTR = 0x61000011
+DT_SCE_EXPORT_LIB = 0x61000013
+DT_SCE_IMPORT_LIB = 0x61000015
+DT_SCE_EXPORT_LIB_ATTR = 0x61000017
+DT_SCE_IMPORT_LIB_ATTR = 0x61000019
+DT_SCE_HASH = 0x61000025
+DT_SCE_PLTGOT = 0x61000027
+DT_SCE_JMPREL = 0x61000029
+DT_SCE_PLTREL = 0x6100002B
+DT_SCE_PLTRELSZ = 0x6100002D
+DT_SCE_RELA = 0x6100002F
+DT_SCE_RELASZ = 0x61000031
+DT_SCE_RELAENT = 0x61000033
+DT_SCE_STRTAB = 0x61000035
+DT_SCE_STRSZ = 0x61000037
+DT_SCE_SYMTAB = 0x61000039
+DT_SCE_SYMENT = 0x6100003B
+DT_SCE_HASHSZ = 0x6100003D
+DT_SCE_SYMTABSZ = 0x6100003F
+
+# Program header indices, as declared in PHDRS in main.script and prx.script:
+# text, relro, data, procparam (or modparam), dynamic, tls, eh_frame, meta.
+TEXT, RELRO, DATA, PARAM, DYNAMIC, TLS, EH_FRAME, META = range(8)
+LINKER_PHDR_TYPES = [PT_LOAD, PT_LOAD, PT_LOAD, None, PT_DYNAMIC, PT_TLS, PT_GNU_EH_FRAME, PT_LOAD]
+
+INTERP = b"/libexec/ld-elf.so.1\0"  # at the start of .text, see main.script
+FINGERPRINT = b"PS4-HOMEBREW-SDK".ljust(0x18, b"\0")  # DT_SCE_FINGERPRINT, at offset 0
+MODULE_NAME = "eboot"
+
+NID_SALT = bytes.fromhex("518d64a635ded8c1e6b039b1c3e55230")
+ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-"
+
+
+def die(message):
+    sys.exit(f"orbis-elf2self: {message}")
+
+
+def align(value, alignment):
+    return (value + alignment - 1) // alignment * alignment
+
+
+# ---------------------------------------------------------------------------
+# Reading ELF files
+# ---------------------------------------------------------------------------
+
+def program_headers(elf):
+    phoff = struct.unpack_from("<Q", elf, 0x20)[0]
+    phnum = struct.unpack_from("<H", elf, 0x38)[0]
+    return [Phdr(*struct.unpack_from(PHDR_FMT, elf, phoff + i * 56)) for i in range(phnum)]
+
+
+def orbis_kind(elf):
+    """"executable" or "prx" for linker output made with main.script or
+    prx.script; None for anything else, including files already converted
+    (their e_type is 0xFE10 or 0xFE18, not ET_DYN)."""
+    if len(elf) < 64 or elf[:4] != b"\x7fELF" or struct.unpack_from("<H", elf, 0x10)[0] != 3:
+        return None
+    types = {p.type for p in program_headers(elf)}
+    return "executable" if PT_SCE_PROCPARAM in types else "prx" if PT_SCE_MODULE_PARAM in types else None
+
+
+def read_sections(elf):
+    shoff = struct.unpack_from("<Q", elf, 0x28)[0]
+    shnum, shstrndx = struct.unpack_from("<HH", elf, 0x3C)
+    headers = [struct.unpack_from("<IIQQQQIIQQ", elf, shoff + i * 64) for i in range(shnum)]
+    names = headers[shstrndx][4]
+    sections = {}
+    for name, _, _, addr, offset, size, *_ in headers:
+        name = elf[names + name:elf.index(b"\0", names + name)].decode()
+        sections[name] = (addr, elf[offset:offset + size])
+    return sections
+
+
+def cstr(blob, offset):
+    return blob[offset:blob.index(b"\0", offset)].decode()
+
+
+def dynamic_symbols(sections):
+    """The linker's .dynsym as (name, fields) pairs, index 0 included."""
+    strings = sections[".dynstr"][1]
+    return [(cstr(strings, fields[0]), fields)
+            for fields in struct.iter_unpack(SYM_FMT, sections[".dynsym"][1])]
+
+
+def stub_exports(soname, stub_dirs):
+    """Names of the symbols the stub for `soname' defines.  The stub is a
+    linker-readable ELF shared object named like the soname (libz.so.6), or
+    X.so for X.sprx, as the SDK's stubs are."""
+    filenames = list(dict.fromkeys([soname, soname.rsplit(".", 1)[0] + ".so"]))
+    for directory in stub_dirs:
+        for filename in filenames:
+            path = os.path.join(directory, filename)
+            if not os.path.isfile(path):
+                continue
+            with open(path, "rb") as f:
+                stub = f.read()
+            # Skip anything but a plain shared object, e.g. a signed X.sprx.
+            if stub[:4] != b"\x7fELF" or struct.unpack_from("<H", stub, 0x10)[0] != 3:
+                continue
+            symbols = dynamic_symbols(read_sections(stub))
+            return {name for name, fields in symbols if fields[3] != 0}  # st_shndx != UNDEF
+    die(f"no stub for {soname} ({' or '.join(filenames)}) in {', '.join(stub_dirs)}")
+
+
+# ---------------------------------------------------------------------------
+# The PS4's names for things
+# ---------------------------------------------------------------------------
+
+def nid(name):
+    """SHA-1 of name + salt, first 8 bytes reversed, base64 with '-' for '/'."""
+    digest = hashlib.sha1(name.encode() + NID_SALT).digest()[:8][::-1]
+    return base64.b64encode(digest)[:11].decode().replace("/", "-")
+
+
+def encode_id(value):
+    """Module and library ids in symbol names, in base 64: 0 is "A", 1 is "B"."""
+    out = ID_ALPHABET[value % 64]
+    while value >= 64:
+        value //= 64
+        out = ID_ALPHABET[value % 64] + out
+    return out
+
+
+def single_bucket_hash(count):
+    """A SysV hash table over `count' symbols with a single bucket, chaining
+    symbols 1 to count - 1, as create-fself makes: it works whatever hash
+    function the loader computes for a name."""
+    chains = [0] + list(range(2, count)) + [0] if count > 1 else [0] * count
+    return struct.pack(f"<{3 + count}I", 1, count, 1 if count > 1 else 0, *chains)
+
+
+class Strings:
+    """A string table; adding the same string twice returns the same offset."""
+
+    def __init__(self):
+        self.data = bytearray(b"\0")
+        self.offsets = {}
+
+    def add(self, text):
+        if text not in self.offsets:
+            self.offsets[text] = len(self.data)
+            self.data += text.encode() + b"\0"
+        return self.offsets[text]
+
+
+# ---------------------------------------------------------------------------
+# Conversion
+# ---------------------------------------------------------------------------
+
+def needed_modules(sections, stub_dirs):
+    """Needed modules, libkernel first (the loader expects it there), then in
+    DT_NEEDED order.  Module i is "X" from "X.sprx"; it has module id i + 1
+    and one library, also named "X", with library id i + 1.  Ids 0 are the
+    module itself and its export library."""
+    modules = []
+    for tag, value in struct.iter_unpack("<qQ", sections[".dynamic"][1]):
+        if tag == DT_NEEDED:
+            soname = cstr(sections[".dynstr"][1], value)
+            modules.append((soname.split(".", 1)[0], stub_exports(soname, stub_dirs)))
+    modules.sort(key=lambda m: m[0] != "libkernel")
+    return [(i, name, exports) for i, (name, exports) in enumerate(modules)]
+
+
+STT_SECTION, STT_TLS = 3, 6
+STB_WEAK = 2
+
+# Every module has its own, from the crt: never exported by an executable.
+PER_MODULE_SYMBOLS = {"_init", "_fini", "_start", "__dso_handle", "module_start", "module_stop"}
+
+
+def is_executable_export(name, fields, modules):
+    """Whether an executable exports a dynamic symbol: one it defines that no
+    needed module provides, i.e. all of its own when linked with -rdynamic.
+    (lld also puts an executable's symbol in .dynsym when a linked shared
+    object defines one of the same name; the stub's is not the executable's
+    to export.)  Thread-locals are not exported: there are no thread-local
+    imports across modules."""
+    return (fields[3] != 0 and fields[1] & 0xF != STT_TLS and name not in PER_MODULE_SYMBOLS
+            and not any(name in m[2] for m in modules))
+
+
+def executable_exports(path, stub_dirs):
+    """Names of the symbols the executable at `path', as linked with
+    main.script and not yet converted, exports once converted."""
+    with open(path, "rb") as f:
+        elf = f.read()
+    if orbis_kind(elf) != "executable":
+        die(f"{path}: not an executable linked with main.script (pass the .elf, not the .self)")
+    sections = read_sections(elf)
+    modules = needed_modules(sections, stub_dirs + [os.path.dirname(os.path.abspath(path))])
+    return {name for i, (name, fields) in enumerate(dynamic_symbols(sections))
+            if i and is_executable_export(name, fields, modules)}
+
+
+def convert(elf, stub_dirs, output, main_exports=None):
+    entry = struct.unpack_from("<Q", elf, 0x18)[0]
+    phdrs = program_headers(elf)
+    prx = orbis_kind(elf) == "prx"
+    script = "prx.script" if prx else "main.script"
+    if not prx and not any(p.type == PT_SCE_PROCPARAM and p.memsz for p in phdrs):
+        die("no process parameters (.sce_process_param); link with crt1.o")
+    if prx and not any(p.type == PT_SCE_MODULE_PARAM and p.memsz for p in phdrs):
+        die("no module parameters (.sce_module_param)")
+    if not prx and main_exports is not None:
+        die("--main is for shared objects; an executable is the main program")
+    if len(phdrs) != len(LINKER_PHDR_TYPES) or any(
+            t is not None and p.type != t for p, t in zip(phdrs, LINKER_PHDR_TYPES)):
+        die(f"unexpected program headers; link with {script}")
+
+    # The loader maps the text, relro and data segments as one contiguous
+    # image of 16 KiB pages.
+    text, relro, data = phdrs[TEXT], phdrs[RELRO], phdrs[DATA]
+    for name, p in (("text", text), ("relro", relro), ("data", data)):
+        if p.vaddr % PAGE or p.offset % PAGE:
+            die(f"the {name} segment is not aligned to 16 KiB pages; link with {script} "
+                f"and -z max-page-size=0x4000")
+    if not text.vaddr < relro.vaddr < data.vaddr:
+        die(f"segments out of order; link with {script}")
+    if relro.offset - text.offset != relro.vaddr - text.vaddr or \
+       data.offset - relro.offset != data.vaddr - relro.vaddr:
+        die("segment file offsets do not follow their addresses")
+    if relro.filesz != relro.memsz:
+        die("the relro segment has a .bss")
+    if not prx and elf[text.offset:text.offset + len(INTERP)] != INTERP:
+        die(f".text does not start with {INTERP[:-1].decode()}; link with main.script")
+
+    sections = read_sections(elf)
+    old_dynamic = list(struct.iter_unpack("<qQ", sections[".dynamic"][1]))
+    linker_tags = dict(old_dynamic)
+    symbols = dynamic_symbols(sections)
+    modules = needed_modules(sections, stub_dirs)
+
+    # With --main, the main program is one more needed module, "eboot", with
+    # one library of the same name, and it is looked in first: a shared
+    # object's references resolve to the main program's exports before those
+    # of its own needed modules, as a dynamic linker looks in an executable
+    # linked with -rdynamic before its libraries.  The crt does not load it:
+    # it is not in the DT_NEEDED entries the crt reads (the linker's).
+    main_module = None
+    if main_exports is not None:
+        main_module = (len(modules), MODULE_NAME, main_exports)
+        modules.append(main_module)
+
+    def provider_of(sym):
+        if main_module is not None and sym in main_module[2]:
+            return main_module
+        return next((m for m in modules if sym in m[2]), None)
+
+    # A shared object's references to a symbol it defines itself also resolve
+    # to the main program's, when that exports one: e.g. when both link the
+    # same static library, so that both use one copy, the main program's.  Such
+    # a symbol gets an import of its own, from the main program, and the
+    # relocations against it are given that instead; the shared object still
+    # exports its own definition.  Only the references that go through a
+    # relocation are redirected: calls the compiler or linker bound directly
+    # are not, as on Linux.
+    interposed = {}
+    if main_module is not None:
+        referenced = {info >> 32
+                      for name in (".rela.dyn", ".rela.plt")
+                      for _, info, _ in struct.iter_unpack("<QQq", sections.get(name, (0, b""))[1])}
+        for i in sorted(referenced):
+            name, fields = symbols[i]
+            if i and fields[3] != 0 and fields[1] & 0xF != STT_TLS and name in main_exports:
+                interposed[i] = len(symbols)
+                symbols.append((name, fields[:3] + (0, 0, 0)))
+
+    # An undefined weak symbol that no needed module provides is resolved here,
+    # to 0, as a dynamic linker would: the PS4's imports must each name a
+    # module.  Its relocations become their values, written into the image,
+    # and the symbol is dropped.  (E.g. a C++ thread_local's initialization
+    # function, _ZTH..., which exists only when the variable needs one.)
+    unresolved_weak = {i for i, (name, fields) in enumerate(symbols)
+                       if i and fields[3] == 0 and fields[1] >> 4 == STB_WEAK and provider_of(name) is None}
+
+    # An executable exports the symbols is_executable_export() says, in one
+    # library named after the module, "eboot", for the shared objects it loads
+    # (see --main).  Its other defined symbols are dropped, renumbering the
+    # rest.  lld never relocates against an executable's own definitions.
+    keep = [i for i, (name, fields) in enumerate(symbols)
+            if i and i not in unresolved_weak and
+            (prx or fields[3] == 0 or is_executable_export(name, fields, modules))]
+    # The new symbol table starts with a null symbol and a section symbol,
+    # as the official linker's does; the linker's symbols follow.
+    index = {0: 0}
+    index.update({old: 2 + new for new, old in enumerate(keep)})
+    exports = prx or any(symbols[i][1][3] != 0 for i in keep)
+
+    image = bytearray(elf)
+
+    def write_resolved(vaddr, value):
+        """Writes a resolved relocation's 8-byte value into the image."""
+        for p in (text, relro, data):
+            if p.vaddr <= vaddr and vaddr + 8 <= p.vaddr + p.memsz:
+                if vaddr + 8 <= p.vaddr + p.filesz:
+                    struct.pack_into("<Q", image, p.offset + vaddr - p.vaddr, value & 0xFFFFFFFFFFFFFFFF)
+                elif value:
+                    die(f"cannot resolve a relocation at {vaddr:#x} in .bss to {value:#x}")
+                return
+        die(f"relocation at {vaddr:#x} is outside the loaded segments")
+
+    R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT = 1, 6, 7
+
+    def renumbered(relocations):
+        out = bytearray()
+        for offset, info, addend in struct.iter_unpack("<QQq", relocations):
+            sym, rtype = info >> 32, info & 0xFFFFFFFF
+            sym = interposed.get(sym, sym)
+            if sym in unresolved_weak:
+                if rtype == R_X86_64_64:
+                    write_resolved(offset, addend)          # S + A, with S = 0
+                elif rtype in (R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT):
+                    write_resolved(offset, 0)               # S
+                else:
+                    die(f"{symbols[sym][0]}: unresolved weak symbol in relocation type {rtype}")
+                continue
+            if sym not in index:
+                die(f"{symbols[sym][0]}: relocation against an exported symbol")
+            out += struct.pack("<QQq", offset, index[sym] << 32 | rtype, addend)
+        return bytes(out)
+
+    rela = renumbered(sections.get(".rela.dyn", (0, b""))[1])
+    jmprel = renumbered(sections.get(".rela.plt", (0, b""))[1])
+    elf = bytes(image)
+
+    # lld records DT_PLTGOT (the start of .got.plt) only when calls go through
+    # a PLT.  Without one (-fno-plt), the tested value is the start of .got.
+    # A program with no GOT at all gets where .got would be: the start of RELRO.
+    got = linker_tags.get(DT_PLTGOT)
+    if got is None:
+        got = sections[".got"][0] if ".got" in sections else relro.vaddr
+
+    strings = Strings()
+    for i, name, _ in modules:
+        strings.add(name + ".prx")
+    for i, name, _ in modules:
+        strings.add(name)
+    if prx:
+        # This module: X from -soname X.sprx, or from the output file name.
+        soname = linker_tags.get(DT_SONAME)
+        soname = cstr(sections[".dynstr"][1], soname) if soname is not None else os.path.basename(output)
+        name = soname.split(".", 1)[0]
+        filename = soname
+    else:
+        name = MODULE_NAME
+        filename = os.path.basename(output)
+    module_info = strings.add(name)
+    original_filename = strings.add(filename)
+
+    # Every undefined dynamic symbol must be an import some needed module
+    # provides, named NID#<library id>#<module id>; a module exports its
+    # defined ones, from library 0 of module 0 (itself).
+    dynsym = bytearray(24)                                    # null symbol
+    dynsym += struct.pack(SYM_FMT, 0, STT_SECTION, 0, 0, 0, 0)  # section symbol
+    for sym, (_, info, other, shndx, value, size) in (symbols[i] for i in keep):
+        if shndx != 0:
+            mangled = f"{nid(sym)}#A#A"
+        else:
+            provider = provider_of(sym)
+            if provider is None:
+                if not prx:
+                    hint = ""
+                elif main_module is None:
+                    hint = " (if the main program defines it, link that with -rdynamic and pass it with --main)"
+                else:
+                    hint = ", nor by the main program (is it linked with -rdynamic?)"
+                die(f"{sym}: not exported by any needed stub{hint}")
+            i = provider[0]
+            mangled = f"{nid(sym)}#{encode_id(i + 1)}#{encode_id(i + 1)}"
+        dynsym += struct.pack(SYM_FMT, strings.add(mangled), info, other, shndx, value, size)
+    if prx:
+        # As create-fself does for a library.
+        for sym in ("module_stop", "module_start"):
+            dynsym += struct.pack(SYM_FMT, strings.add(sym), STB_WEAK << 4, 0, 0, 0, 0)
+    hashtab = single_bucket_hash(len(dynsym) // 24)
+    dynstr = bytes(strings.data)
+
+    # PT_SCE_DYNLIBDATA: the fingerprint, then the tables, at offsets the
+    # dynamic table gives, relative to the start of the segment.
+    dynlib = bytearray(FINGERPRINT)
+
+    def put(blob, alignment):
+        dynlib.extend(bytes(align(len(dynlib), alignment) - len(dynlib)))
+        dynlib.extend(blob)
+        return len(dynlib) - len(blob)
+
+    o_str = put(dynstr, 1)
+    o_sym = put(dynsym, 8)
+    o_jmprel = put(jmprel, 8)
+    o_rela = put(rela, 8)
+    o_hash = put(hashtab, 8)
+
+    tags = [
+        (DT_SCE_HASH, o_hash), (DT_SCE_HASHSZ, len(hashtab)),
+        (DT_SCE_STRTAB, o_str), (DT_SCE_STRSZ, len(dynstr)),
+        (DT_SCE_SYMTAB, o_sym), (DT_SCE_SYMTABSZ, len(dynsym)), (DT_SCE_SYMENT, 24),
+        (DT_SCE_RELA, o_rela), (DT_SCE_RELASZ, len(rela)), (DT_SCE_RELAENT, 24),
+        (DT_SCE_PLTGOT, got),
+        (DT_SCE_JMPREL, o_jmprel), (DT_SCE_PLTRELSZ, len(jmprel)), (DT_SCE_PLTREL, DT_RELA),
+    ]
+    # The system calls a shared object's init and fini functions itself; an
+    # executable's crt calls its own.
+    if prx:
+        tags += [(tag, linker_tags[tag]) for tag in (DT_INIT, DT_FINI) if tag in linker_tags]
+    tags += [(DT_DEBUG, 0)]
+    if not prx:
+        tags += [(DT_TEXTREL, 0)]
+    tags += [(DT_FLAGS, 0 if prx else DF_TEXTREL)]
+    for i, module, _ in modules:
+        tags += [(DT_NEEDED, strings.offsets[module + ".prx"])]
+    for i, module, _ in modules:
+        # name, version 1.1, module id
+        tags += [(DT_SCE_NEEDED_MODULE, strings.offsets[module] | 1 << 32 | 1 << 40 | (i + 1) << 48)]
+    if exports:
+        tags += [
+            (DT_SCE_EXPORT_LIB, module_info | 1 << 32),            # name, version 1, library id 0
+            (DT_SCE_EXPORT_LIB_ATTR, 0x1),                        # library id 0
+        ]
+    for i, module, _ in modules:
+        tags += [
+            (DT_SCE_IMPORT_LIB, strings.offsets[module] | 1 << 32 | (i + 1) << 48),
+            (DT_SCE_IMPORT_LIB_ATTR, 0x9 | (i + 1) << 48),
+        ]
+    tags += [
+        (DT_SCE_FINGERPRINT, 0),
+        (DT_SCE_ORIGINAL_FILENAME, original_filename),
+        (DT_SCE_MODULE_INFO, module_info | 1 << 32 | 1 << 40),     # name, version 1.1, module id 0
+        (DT_SCE_MODULE_ATTR, 0),
+        (DT_NULL, 0),
+    ]
+    dynamic = b"".join(struct.pack("<qQ", *t) for t in tags)
+    o_dyn = put(dynamic, 16)
+
+    # The output is the linker's file up to the end of the data segment, then
+    # PT_SCE_DYNLIBDATA at a 16-byte aligned offset.  The linker's own tables
+    # (the `meta' segment) are left out.
+    file_end = data.offset + data.filesz
+    dynlib_file = align(file_end, 16)
+    out = bytearray(elf[:file_end]).ljust(dynlib_file, b"\0") + dynlib
+
+    new = [
+        Phdr(PT_LOAD, PF_R | PF_X, text.offset, text.vaddr, text.vaddr,
+             relro.vaddr - text.vaddr, relro.vaddr - text.vaddr, PAGE),
+        Phdr(PT_SCE_RELRO, PF_R, relro.offset, relro.vaddr, relro.vaddr,
+             data.vaddr - relro.vaddr, data.vaddr - relro.vaddr, PAGE),
+        Phdr(PT_LOAD, PF_R | PF_W, data.offset, data.vaddr, data.vaddr, data.filesz, data.memsz, PAGE),
+        phdrs[PARAM]._replace(paddr=phdrs[PARAM].vaddr, align=8),
+        Phdr(PT_DYNAMIC, PF_R | PF_W, dynlib_file + o_dyn, dynlib_file + o_dyn, dynlib_file + o_dyn,
+             len(dynamic), len(dynamic), 8),
+    ]
+    if not prx:
+        new.append(Phdr(PT_INTERP, PF_R, text.offset, text.vaddr, text.vaddr, len(INTERP), len(INTERP), 1))
+    if phdrs[TLS].memsz:
+        new.append(phdrs[TLS]._replace(paddr=phdrs[TLS].vaddr, align=max(phdrs[TLS].align, 32)))
+    if phdrs[EH_FRAME].memsz:
+        new.append(phdrs[EH_FRAME]._replace(paddr=phdrs[EH_FRAME].vaddr))
+    new.append(Phdr(PT_SCE_DYNLIBDATA, PF_R, dynlib_file, 0, 0, len(dynlib), 0, 16))
+
+    if 64 + 56 * max(len(new), len(phdrs)) > text.offset:
+        die("no room for the program headers before .text")
+
+    # ELF header: FreeBSD OS ABI, type ET_SCE_EXEC_ASLR (0xFE10) or
+    # ET_SCE_DYNAMIC (0xFE18), no sections.
+    ident = b"\x7fELF\x02\x01\x01\x09" + bytes(8)
+    out[:64] = struct.pack("<16sHHIQQQIHHHHHH", ident, 0xFE18 if prx else 0xFE10, 0x3E, 1, entry, 64, 0, 0,
+                           64, 56, len(new), 0, 0, 0)
+    out[64:64 + 56 * len(phdrs)] = bytes(56 * len(phdrs))
+    out[64:64 + 56 * len(new)] = b"".join(struct.pack(PHDR_FMT, *p) for p in new)
+    return out
+
+
+# ===========================================================================
+# Signing
+# ===========================================================================
+
+def ensure_hex_string(val, **kwargs):
+	exact_size = int(kwargs['exact_size']) if 'exact_size' in kwargs else None
+	min_size = int(kwargs['min_size']) if 'min_size' in kwargs else None
+	max_size = int(kwargs['max_size']) if 'max_size' in kwargs else None
+
+	val = re.sub(r'\s+', '', val)
+	val_size = len(val)
+	if val_size > 0:
+		if val.startswith('0x') or val.startswith('0X'):
+			val = val[2:]
+		if len(val) % 2 != 0 or not all(x in string.hexdigits for x in val):
+			return None
+		val = bytes.fromhex(val)
+		val_size = len(val)
+
+	if not exact_size is None and val_size != exact_size:
+		return None
+	else:
+		if not min_size is None and val_size < min_size:
+			return None
+		if not max_size is None and val_size > max_size:
+			return None
+
+	return val
+
+def input_file_type(val):
+	if not os.access(val, os.F_OK | os.R_OK) or not os.path.isfile(val):
+		raise argparse.ArgumentTypeError('invalid input file: {0}'.format(val))
+	return val
+
+def output_file_type(val):
+	if os.access(val, os.F_OK) and (not os.path.isfile(val) or not os.access(val, os.F_OK | os.W_OK)):
+		raise argparse.ArgumentTypeError('invalid output file: {0}'.format(val))
+	return val
+
+def auth_info_type(val):
+	new_val = ensure_hex_string(val, exact_size=0x88)
+	if new_val is None:
+		raise argparse.ArgumentTypeError('invalid auth info: {0}'.format(val))
+	return new_val
+
+class MyParser(argparse.ArgumentParser):
+	def error(self, message):
+		self.print_help()
+		sys.stderr.write('\nerror: {0}\n'.format(message))
+		sys.exit(2)
+
+if __name__ == '__main__':
+    parser = MyParser(description='fake signed elf maker')
+    parser.add_argument('input', type=input_file_type, default=None, help='elf/prx file path')
+    parser.add_argument('output', type=output_file_type, default=None, help='self/sprx file path')
+    parser.add_argument('--paid', type=int_with_base_type, default=0x3100000000000002, help='program authentication id')
+    parser.add_argument('--ptype', default=None, help='program type {fake, npdrm_exec, npdrm_dynlib, system_exec, system_dynlib, host_kernel, secure_module, secure_kernel}')
+    parser.add_argument('--app-version', type=int_with_base_type, default=0, help='application version')
+    parser.add_argument('--fw-version', type=int_with_base_type, default=0, help='firmware version')
+    parser.add_argument('--auth-info', type=auth_info_type, default=None, help='authentication info')
+    parser.add_argument('-L', dest='stub_dirs', action='append', default=[], metavar='DIR', help='also look for stub libraries in DIR')
+    parser.add_argument('--elf', default=None, metavar='FILE', help='also write the converted, unsigned ELF to FILE')
+    parser.add_argument('--main', default=None, metavar='FILE', help='for a shared object: resolve against the exports of the main program FILE (as linked, e.g. with -rdynamic) first')
+
+    if len(sys.argv) == 1:
+        parser.print_usage()
+        sys.exit(1)
+
+    args = parser.parse_args()
+
+    paid = args.paid
+    if not (0 <= paid <= 0xFFFFFFFFFFFFFFFF):
+        parser.error('invalid program authentication id: 0x{0:016X}'.format(paid))
+
+    ptype = SignedElfExInfo.PTYPE_FAKE
+    if not args.ptype is None:
+        ptype = {
+            'fake': SignedElfExInfo.PTYPE_FAKE,
+            'npdrm_exec': SignedElfExInfo.PTYPE_NPDRM_EXEC,
+            'npdrm_dynlib': SignedElfExInfo.PTYPE_NPDRM_DYNLIB,
+            'system_exec': SignedElfExInfo.PTYPE_SYSTEM_EXEC,
+            'system_dynlib': SignedElfExInfo.PTYPE_SYSTEM_DYNLIB,
+            'host_kernel': SignedElfExInfo.PTYPE_HOST_KERNEL,
+            'secure_module': SignedElfExInfo.PTYPE_SECURE_MODULE,
+            'secure_kernel': SignedElfExInfo.PTYPE_SECURE_KERNEL,
+        }.get(args.ptype.strip().lower(), None)
+        if ptype is None:
+            ptype = try_parse_int(args.ptype)
+        if ptype is None:
+            parser.error('invalid program type: 0x{0:016X}'.format(ptype))
+    if not (0 <= ptype <= 0xFFFFFFFFFFFFFFFF):
+        parser.error('invalid program type: 0x{0:016X}'.format(ptype))
+
+    app_version = args.app_version
+    if not (0 <= app_version <= 0xFFFFFFFFFFFFFFFF):
+        parser.error('invalid application version: 0x{0:016X}'.format(app_version))
+
+    fw_version = args.fw_version
+    if not (0 <= fw_version <= 0xFFFFFFFFFFFFFFFF):
+        parser.error('invalid firmware version: 0x{0:016X}'.format(fw_version))
+
+    auth_info = args.auth_info
+    if auth_info is None:
+        auth_info = auth_info_type(AUTH_INFO)
+
+    elf_file_path = args.input
+    fself_file_path = args.output
+
+    # A file linked with main.script or prx.script is converted first; anything
+    # else (e.g. an ELF converted earlier) is signed as it is.
+    with open(elf_file_path, 'rb') as f:
+        elf_data = f.read()
+    if elf_data[:4] == b'\x7fELF' and struct.unpack_from('<H', elf_data, 0x10)[0] in (2, 3) \
+       and not orbis_kind(elf_data):
+        # A plain ET_EXEC or ET_DYN: the PS4 cannot load that as it is.
+        die(f"{elf_file_path}: not linked with main.script or prx.script (use orbis-clang or orbis-ld)")
+    if orbis_kind(elf_data):
+        here = os.path.dirname(os.path.realpath(__file__))
+        stub_dirs = args.stub_dirs + [os.path.dirname(os.path.abspath(elf_file_path)),
+                                      os.path.join(here, '..', 'target', 'lib'),
+                                      os.path.join(here, '..', 'target', 'usr', 'lib')]
+        main_exports = executable_exports(args.main, stub_dirs) if args.main else None
+        elf_data = bytes(convert(elf_data, stub_dirs, fself_file_path, main_exports))
+        if args.elf:
+            with open(args.elf, 'wb') as f:
+                f.write(elf_data)
+
+    #print('loading elf file: {0}'.format(elf_file_path))
+    try:
+        with io.BytesIO(elf_data) as f:
+            elf_file = ElfFile(ignore_shdrs=True)
+            elf_file.load(f)
+    except Exception as err:
+        traceback.print_exc()
+        print('')
+        parser.error('unable to load elf file: {0} ({1})'.format(elf_file_path, err))
+
+    #print('saving fake signed elf file: {0}'.format(fself_file_path))
+    try:
+        with open(fself_file_path, 'wb') as f:
+            self_file = SignedElfFile(elf_file, paid=paid, ptype=ptype, app_version=app_version, fw_version=fw_version, auth_info=auth_info)
+            self_file.save(f)
+    except Exception as err:
+        traceback.print_exc()
+        print('')
+        parser.error('unable to save fself file: {0} ({1})'.format(elf_file_path, err))
+
