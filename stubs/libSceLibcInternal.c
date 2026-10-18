@@ -7631,9 +7631,9 @@ asm(".global memset\n"
     ".type memset @function\n"
     "memset:\n");
 
-asm(".global memset_s\n"
-    ".type memset_s @function\n"
-    "memset_s:\n");
+//asm(".global memset_s\n"
+//    ".type memset_s @function\n"
+//    "memset_s:\n");
 
 asm(".global mergesort\n"
     ".type mergesort @function\n"
