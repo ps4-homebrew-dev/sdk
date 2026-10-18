@@ -43,7 +43,14 @@ jobs:
     - name: Build samples
       run: |
         source $PS4_HOMEBREW_SDK/toolchain/orbis.sh
+        $MAKE -C samples/hello_dlfcn
         $MAKE -C samples/hello_world
+        $MAKE -C samples/link_sprx
+        $CMAKE -S samples/hello_cmake -B samples/hello_cmake/build
+        $CMAKE --build samples/hello_cmake/build
+        $MESON setup samples/hello_meson samples/hello_meson/build
+        $MESON compile -C samples/hello_meson/build
+
       env:
         PS4_HOMEBREW_SDK: ${{ runner.tool_cache }}/ps4-homebrew-sdk
 
