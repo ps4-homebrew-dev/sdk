@@ -22,7 +22,7 @@ jobs:
     - name: Install prerequisites
       run: |
         sudo apt update
-        sudo apt install llvm-20 clang-20 lld-20
+        sudo apt install llvm-20 clang-20 lld-20 cmake meson
 
     - name: Build SDK
       run: |
