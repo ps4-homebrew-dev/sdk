@@ -28,7 +28,7 @@ OBJS := $(SRCS:.c=.o) _setjmp.o
 
 .PHONY: all clean install
 
-all: libc.a libdl.a libpthread.a
+all: libc.a libdl.a libpthread.a libexecinfo.a
 
 libc.a: $(OBJS)
 	$(AR) -rsc $@ $^
