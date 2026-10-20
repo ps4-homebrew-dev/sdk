@@ -39,6 +39,9 @@ libdl.a:
 libpthread.a:
 	$(AR) -rsc $@
 
+libexecinfo.a:
+	$(AR) -rsc $@
+
 clean:
 	rm -f *.a *.o
 
