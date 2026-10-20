@@ -45,8 +45,9 @@ libexecinfo.a:
 clean:
 	rm -f *.a *.o
 
-install: libc.a libdl.a libpthread.a
+install: libc.a libdl.a libpthread.a libexecinfo.a
 	install -d $(DESTDIR)/target/lib
 	install libc.a $(DESTDIR)/target/lib
 	install libdl.a $(DESTDIR)/target/lib
 	install libpthread.a $(DESTDIR)/target/lib
+	install libexecinfo.a $(DESTDIR)/target/lib
