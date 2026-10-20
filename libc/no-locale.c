@@ -345,7 +345,7 @@ newlocale(int mask, const char *locale, locale_t base) {
 
 locale_t
 duplocale(locale_t loc) {
-    return calloc(sizeof(int), 1);
+  return calloc(sizeof(int), 1);
 }
 
 
