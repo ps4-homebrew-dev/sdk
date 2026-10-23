@@ -45,7 +45,7 @@ tmpfile(void) {
 
   unlink(path);
 
-  if(!(f=fdopen(fd, "rw+b"))) {
+  if(!(f=fdopen(fd, "w+b"))) {
     close(fd);
   }
 
