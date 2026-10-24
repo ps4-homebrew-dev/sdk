@@ -45,10 +45,42 @@ with open(NID_DB) as f:
         nid_map[nid] = sym
 
 
+ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-'
+
+
+def decode_id(text):
+    '''
+    decode a module or library id from a symbol name (NID#<lib>#<mod>),
+    in base 64: "A" is 0, "B" is 1, "BA" is 64.
+    '''
+    value = 0
+    for c in text:
+        value = value * 64 + ID_ALPHABET.index(c)
+    return value
+
+
+def read_cstr(f, offset):
+    f.seek(offset)
+    data = b''
+    while True:
+        chunk = f.read(64)
+        if not chunk:
+            break
+        if b'\0' in chunk:
+            data += chunk[:chunk.index(b'\0')]
+            break
+        data += chunk
+    return data.decode('ascii')
+
+
 def symbols(sym_type, filename):
     '''
-    yield symbol names in dynamic segments using the NID lookup table
-    'aerolib.csv'. Based on:
+    yield (name, version) of the symbols in dynamic segments, named using the
+    NID lookup table 'aerolib.csv'.  The version is "<module>:<library>": the
+    name of the module, from DT_SCE_MODULE_INFO, and that of the library that
+    exports the symbol, from DT_SCE_EXPORT_LIB.  These often differ from the
+    file name.
+    Based on:
     https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/blob/master/scripts/symbol_entries.py
     '''
     with open(filename, 'rb') as f:
@@ -69,6 +101,8 @@ def symbols(sym_type, filename):
         dyncnt = int(dynamic.p_filesz / struct.calcsize('<QQ'))
         symtab = strtab = dynlibdata.p_offset
         symcnt = 0
+        module_info = None
+        export_libs = []
 
         for i in range(dyncnt):
             f.seek(dynamic.p_offset + (i * struct.calcsize('<QQ')))
@@ -82,6 +116,19 @@ def symbols(sym_type, filename):
 
             if d_tag == 0x6100003F: # DT_SCE_SYMTABSZ
                 symcnt = int(d_val / struct.calcsize('<IBBHQQ'))
+
+            if d_tag == 0x6100000D: # DT_SCE_MODULE_INFO
+                module_info = d_val
+
+            if d_tag == 0x61000013: # DT_SCE_EXPORT_LIB
+                export_libs.append(d_val)
+
+        # Name offset in the low 32 bits, id in the high 16.
+        module = None
+        if module_info is not None:
+            module = read_cstr(f, strtab + (module_info & 0xFFFFFFFF))
+        libs = {val >> 48: read_cstr(f, strtab + (val & 0xFFFFFFFF))
+                for val in export_libs}
 
         for i in range(symcnt):
             f.seek(symtab + (i * struct.calcsize('<IBBHQQ')))
@@ -103,24 +150,77 @@ def symbols(sym_type, filename):
             if sym_type == 'STT_FUNC' and st_type != 2:
                 continue
 
-            f.seek(strtab + st_name)
-            symname = f.read(14).decode('ascii')
+            symname = read_cstr(f, strtab + st_name)
+            if symname.count('#') != 2:
+                continue
             nid, lid, mid = symname.split('#')
 
-            if nid in nid_map:
-                yield nid_map[nid]
+            if nid not in nid_map:
+                continue
+
+            version = None
+            lib = libs.get(decode_id(lid))
+            if module and lib:
+                version = module + ':' + lib
+
+            yield nid_map[nid], version
+
+
+def versioned(syms):
+    '''
+    map each symbol name to one version.  A name that several of the module's
+    libraries export gets the library named like the module, if that is one of
+    them, and else the first one by name, so that the choice is stable.
+    '''
+    candidates = {}
+    for name, version in syms:
+        candidates.setdefault(name, set()).add(version)
+
+    result = {}
+    for name, versions in candidates.items():
+        versions = sorted(v for v in versions if v)
+        preferred = [v for v in versions if v.split(':')[0] == v.split(':')[1]]
+        result[name] = (preferred or versions or [None])[0]
+    return result
+
+
+def version_script(syms):
+    '''
+    a version script for ld.lld that gives each symbol its version.
+    orbis-elf2self reads the versions back from the stub to name the module
+    and library each symbol is imported from.
+    '''
+    nodes = {}
+    for name, version in sorted(syms.items()):
+        if version:
+            nodes.setdefault(version, []).append(name)
+
+    out = []
+    for version in sorted(nodes):
+        out.append(version + ' {')
+        out.append('  global:')
+        out.extend('    ' + name + ';' for name in nodes[version])
+        out.append('};')
+        out.append('')
+    return '\n'.join(out)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--version-script', action='store_true',
+                        help='print a version script for ld.lld, naming the '
+                        'module and library of each symbol, instead of C')
     parser.add_argument('SPRX_FILE')
     cli_args = parser.parse_args()
 
-    funcs = sorted(set(symbols('STT_FUNC', cli_args.SPRX_FILE)))
-    gvars = sorted(set(symbols('STT_OBJECT', cli_args.SPRX_FILE)))
+    funcs = versioned(symbols('STT_FUNC', cli_args.SPRX_FILE))
+    gvars = versioned(symbols('STT_OBJECT', cli_args.SPRX_FILE))
 
-    for name in sorted(funcs):
-        print(tmpl_func.substitute(name=name))
+    if cli_args.version_script:
+        print(version_script({**gvars, **funcs}), end='')
+    else:
+        for name in sorted(funcs):
+            print(tmpl_func.substitute(name=name))
 
-    for name in sorted(gvars):
-        print(tmpl_obj.substitute(name=name))
+        for name in sorted(gvars):
+            print(tmpl_obj.substitute(name=name))

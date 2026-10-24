@@ -22,6 +22,7 @@ CFLAGS += -Wall -Werror -fvisibility-nodllstorageclass=default
 
 SPRXS := $(wildcard *.sprx)
 STUBS := $(SPRXS:.sprx=.c)
+VERS  := $(SPRXS:.sprx=.ver)
 
 SOURCES  := $(wildcard *.c)
 SHARED   := $(SOURCES:.c=.so)
@@ -33,7 +34,7 @@ NID_DB_URL := https://raw.githubusercontent.com/zecoxao/sce_symbols/main/$(NID_D
 
 all: $(SOURCES) $(SHARED)
 
-stubs: $(NID_DB) $(STUBS)
+stubs: $(NID_DB) $(STUBS) $(VERS)
 
 $(NID_DB):
 	wget -O $@ $(NID_DB_URL)
@@ -41,11 +42,16 @@ $(NID_DB):
 %.c: %.sprx
 	$(PYTHON) genstub.py $^ > $@
 
+%.ver: %.sprx
+	$(PYTHON) genstub.py --version-script $^ > $@
+
 %.o: %.c
 	$(CC) -c $(CFLAGS) -o $@ $^
 
-%.so: %.o
-	$(LD) -m elf_x86_64 -shared -soname $*.sprx -o $@ $<
+.SECONDEXPANSION:
+%.so: %.o $$(wildcard $$*.ver)
+	$(LD) -m elf_x86_64 -shared -soname $*.sprx \
+	      $(if $(wildcard $*.ver),--version-script=$*.ver) -o $@ $<
 
 clean:
 	rm -f *.o *.so $(NID_DB)

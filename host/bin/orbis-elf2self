@@ -735,7 +735,12 @@ class SignedElfFile(object):
 # Imports are resolved against the stub libraries: the module needed as X.sprx
 # is described by the stub X.so (or a file named exactly like the soname),
 # looked up in the -L directories, the input file's directory and the SDK.
-# Each needed module X is imported as one library, also named X.  A shared
+# The module is needed as X.prx.  A stub may give each of its symbols a version
+# "<module>:<library>", naming the module and the library the system exports
+# it from, which need not be X: libSceAppContent.sprx is the module
+# libSceAppContentUtil, for instance, with the library libSceAppContent.
+# Without versions, the module X is imported as X, from one library also
+# named X.  A shared
 # object exports its defined dynamic symbols in one library named after the
 # module: X, from its soname or else from the output file name (X.sprx).
 #
@@ -848,10 +853,38 @@ def dynamic_symbols(sections):
             for fields in struct.iter_unpack(SYM_FMT, sections[".dynsym"][1])]
 
 
+def symbol_versions(sections):
+    """The version names of the linker's .dynsym symbols, by symbol index,
+    from .gnu.version and .gnu.version_d; unversioned symbols are left out."""
+    if ".gnu.version" not in sections or ".gnu.version_d" not in sections:
+        return {}
+    strings = sections[".dynstr"][1]
+    verdef = sections[".gnu.version_d"][1]
+    names = {}
+    offset = 0
+    while offset + 20 <= len(verdef):
+        _, _, ndx, cnt, _, aux, next_ = struct.unpack_from("<HHHHIII", verdef, offset)
+        if cnt:
+            names[ndx] = cstr(strings, struct.unpack_from("<I", verdef, offset + aux)[0])
+        if not next_:
+            break
+        offset += next_
+    versym = sections[".gnu.version"][1]
+    versions = {}
+    for i, (value,) in enumerate(struct.iter_unpack("<H", versym)):
+        ndx = value & 0x7FFF
+        if ndx > 1 and ndx in names:  # 0 and 1 are local and global (unversioned)
+            versions[i] = names[ndx]
+    return versions
+
+
 def stub_exports(soname, stub_dirs):
-    """Names of the symbols the stub for `soname' defines.  The stub is a
-    linker-readable ELF shared object named like the soname (libz.so.6), or
-    X.so for X.sprx, as the SDK's stubs are."""
+    """The symbols the stub for `soname' defines, each with its version
+    (None if unversioned).  The stub is a linker-readable ELF shared object
+    named like the soname (libz.so.6), or X.so for X.sprx, as the SDK's stubs
+    are.  The SDK's stubs give each symbol a version "<module>:<library>",
+    naming the module and library the system exports it from (see
+    stubs/genstub.py)."""
     filenames = list(dict.fromkeys([soname, soname.rsplit(".", 1)[0] + ".so"]))
     for directory in stub_dirs:
         for filename in filenames:
@@ -863,8 +896,10 @@ def stub_exports(soname, stub_dirs):
             # Skip anything but a plain shared object, e.g. a signed X.sprx.
             if stub[:4] != b"\x7fELF" or struct.unpack_from("<H", stub, 0x10)[0] != 3:
                 continue
-            symbols = dynamic_symbols(read_sections(stub))
-            return {name for name, fields in symbols if fields[3] != 0}  # st_shndx != UNDEF
+            sections = read_sections(stub)
+            versions = symbol_versions(sections)
+            return {name: versions.get(i) for i, (name, fields) in enumerate(dynamic_symbols(sections))
+                    if fields[3] != 0}  # st_shndx != UNDEF
     die(f"no stub for {soname} ({' or '.join(filenames)}) in {', '.join(stub_dirs)}")
 
 
@@ -913,18 +948,64 @@ class Strings:
 # Conversion
 # ---------------------------------------------------------------------------
 
+# A needed module: its index (its module id is index + 1), the file it is
+# loaded from ("X" for X.sprx, needed as X.prx), the name it is imported by,
+# and the symbols it exports, each mapped to the library it is imported from.
+Module = namedtuple("Module", "index file name exports")
+
+
+def stub_module(soname, stub_dirs):
+    """The file, module name and exports of the stub for `soname'.  Without
+    versions, the module and its one library are named after the file, X;
+    with them, each symbol's version "<module>:<library>" names both."""
+    file = soname.split(".", 1)[0]
+    exports = {}
+    names = set()
+    unversioned = []
+    for sym, version in stub_exports(soname, stub_dirs).items():
+        if version is None:
+            exports[sym] = file
+            unversioned.append(sym)
+            continue
+        if version.count(":") != 1 or "" in version.split(":"):
+            die(f"{soname}: {sym}: version {version} is not <module>:<library>")
+        name, exports[sym] = version.split(":")
+        names.add(name)
+    if len(names) > 1:
+        die(f"{soname}: the stub's versions name several modules: {', '.join(sorted(names))}")
+    if names and unversioned:
+        die(f"{soname}: {unversioned[0]}: unversioned, unlike the stub's other symbols")
+    return file, names.pop() if names else file, exports
+
+
 def needed_modules(sections, stub_dirs):
     """Needed modules, libkernel first (the loader expects it there), then in
-    DT_NEEDED order.  Module i is "X" from "X.sprx"; it has module id i + 1
-    and one library, also named "X", with library id i + 1.  Ids 0 are the
-    module itself and its export library."""
+    DT_NEEDED order.  Ids 0 are the module itself and its export library."""
     modules = []
     for tag, value in struct.iter_unpack("<qQ", sections[".dynamic"][1]):
         if tag == DT_NEEDED:
-            soname = cstr(sections[".dynstr"][1], value)
-            modules.append((soname.split(".", 1)[0], stub_exports(soname, stub_dirs)))
+            modules.append(stub_module(cstr(sections[".dynstr"][1], value), stub_dirs))
     modules.sort(key=lambda m: m[0] != "libkernel")
-    return [(i, name, exports) for i, (name, exports) in enumerate(modules)]
+    return [Module(i, *m) for i, m in enumerate(modules)]
+
+
+def import_libraries(modules, imported):
+    """The libraries imported from: (library id, module, library name), in
+    module order, with library ids from 1.  A module's libraries are those its
+    `imported' symbols come from, by name, the one named like the module
+    first.  A module none are imported from still gets one, as every needed
+    module always has: the one named like the module, or else the first by
+    name (X, without versions).  Without versions, module i thus has one
+    library, named like it, with id i + 1, as before."""
+    libraries = []
+    for m in modules:
+        names = {m.exports[sym] for sym in imported.get(m.index, ())}
+        if not names:
+            names = {m.name} if m.name in m.exports.values() or not m.exports \
+                else {min(m.exports.values())}
+        for name in sorted(names, key=lambda n: (n != m.name, n)):
+            libraries.append((len(libraries) + 1, m, name))
+    return libraries
 
 
 STT_SECTION, STT_TLS = 3, 6
@@ -942,7 +1023,7 @@ def is_executable_export(name, fields, modules):
     to export.)  Thread-locals are not exported: there are no thread-local
     imports across modules."""
     return (fields[3] != 0 and fields[1] & 0xF != STT_TLS and name not in PER_MODULE_SYMBOLS
-            and not any(name in m[2] for m in modules))
+            and not any(name in m.exports for m in modules))
 
 
 def executable_exports(path, stub_dirs):
@@ -1004,13 +1085,14 @@ def convert(elf, stub_dirs, output, main_exports=None):
     # it is not in the DT_NEEDED entries the crt reads (the linker's).
     main_module = None
     if main_exports is not None:
-        main_module = (len(modules), MODULE_NAME, main_exports)
+        main_module = Module(len(modules), MODULE_NAME, MODULE_NAME,
+                             {sym: MODULE_NAME for sym in main_exports})
         modules.append(main_module)
 
     def provider_of(sym):
-        if main_module is not None and sym in main_module[2]:
+        if main_module is not None and sym in main_module.exports:
             return main_module
-        return next((m for m in modules if sym in m[2]), None)
+        return next((m for m in modules if sym in m.exports), None)
 
     # A shared object's references to a symbol it defines itself also resolve
     # to the main program's, when that exports one: e.g. when both link the
@@ -1096,10 +1178,23 @@ def convert(elf, stub_dirs, output, main_exports=None):
     if got is None:
         got = sections[".got"][0] if ".got" in sections else relro.vaddr
 
+    # The libraries imported from, each with its library id: see
+    # import_libraries().
+    imported = {}
+    for i in keep:
+        sym, fields = symbols[i]
+        provider = provider_of(sym) if fields[3] == 0 else None
+        if provider is not None:
+            imported.setdefault(provider.index, set()).add(sym)
+    libraries = import_libraries(modules, imported)
+    library_ids = {(m.index, name): lid for lid, m, name in libraries}
+
     strings = Strings()
-    for i, name, _ in modules:
-        strings.add(name + ".prx")
-    for i, name, _ in modules:
+    for m in modules:
+        strings.add(m.file + ".prx")
+    for m in modules:
+        strings.add(m.name)
+    for _, _, name in libraries:
         strings.add(name)
     if prx:
         # This module: X from -soname X.sprx, or from the output file name.
@@ -1131,8 +1226,8 @@ def convert(elf, stub_dirs, output, main_exports=None):
                 else:
                     hint = ", nor by the main program (is it linked with -rdynamic?)"
                 die(f"{sym}: not exported by any needed stub{hint}")
-            i = provider[0]
-            mangled = f"{nid(sym)}#{encode_id(i + 1)}#{encode_id(i + 1)}"
+            lid = library_ids[(provider.index, provider.exports[sym])]
+            mangled = f"{nid(sym)}#{encode_id(lid)}#{encode_id(provider.index + 1)}"
         dynsym += struct.pack(SYM_FMT, strings.add(mangled), info, other, shndx, value, size)
     if prx:
         # As create-fself does for a library.
@@ -1172,20 +1267,20 @@ def convert(elf, stub_dirs, output, main_exports=None):
     if not prx:
         tags += [(DT_TEXTREL, 0)]
     tags += [(DT_FLAGS, 0 if prx else DF_TEXTREL)]
-    for i, module, _ in modules:
-        tags += [(DT_NEEDED, strings.offsets[module + ".prx"])]
-    for i, module, _ in modules:
+    for m in modules:
+        tags += [(DT_NEEDED, strings.offsets[m.file + ".prx"])]
+    for m in modules:
         # name, version 1.1, module id
-        tags += [(DT_SCE_NEEDED_MODULE, strings.offsets[module] | 1 << 32 | 1 << 40 | (i + 1) << 48)]
+        tags += [(DT_SCE_NEEDED_MODULE, strings.offsets[m.name] | 1 << 32 | 1 << 40 | (m.index + 1) << 48)]
     if exports:
         tags += [
             (DT_SCE_EXPORT_LIB, module_info | 1 << 32),            # name, version 1, library id 0
             (DT_SCE_EXPORT_LIB_ATTR, 0x1),                        # library id 0
         ]
-    for i, module, _ in modules:
+    for lid, _, name in libraries:
         tags += [
-            (DT_SCE_IMPORT_LIB, strings.offsets[module] | 1 << 32 | (i + 1) << 48),
-            (DT_SCE_IMPORT_LIB_ATTR, 0x9 | (i + 1) << 48),
+            (DT_SCE_IMPORT_LIB, strings.offsets[name] | 1 << 32 | lid << 48),  # name, version 1, library id
+            (DT_SCE_IMPORT_LIB_ATTR, 0x9 | lid << 48),
         ]
     tags += [
         (DT_SCE_FINGERPRINT, 0),

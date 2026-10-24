@@ -98,6 +98,10 @@ SECTIONS {
     .rela.plt : { *(.rela.plt) } : meta
     .hash : { *(.hash) } : meta
     .gnu.hash : { *(.gnu.hash) } : meta
+    /* Symbol versions, when linked against versioned stubs */
+    .gnu.version : { *(.gnu.version) } : meta
+    .gnu.version_d : { *(.gnu.version_d) } : meta
+    .gnu.version_r : { *(.gnu.version_r) } : meta
 
     /DISCARD/ : {
         *(.interp)
