@@ -1,0 +1,57 @@
+libSceAppContentUtil:libSceAppContent {
+  global:
+    _Z5dummyv;
+    sceAppContentAddcontDelete;
+    sceAppContentAddcontEnqueueDownload;
+    sceAppContentAddcontEnqueueDownloadSp;
+    sceAppContentAddcontMount;
+    sceAppContentAddcontShrink;
+    sceAppContentAddcontUnmount;
+    sceAppContentAppParamGetInt;
+    sceAppContentAppParamGetString;
+    sceAppContentDownload0Expand;
+    sceAppContentDownload0Shrink;
+    sceAppContentDownload1Expand;
+    sceAppContentDownload1Shrink;
+    sceAppContentDownloadDataFormat;
+    sceAppContentDownloadDataGetAvailableSpaceKb;
+    sceAppContentGetAddcontDownloadProgress;
+    sceAppContentGetAddcontInfo;
+    sceAppContentGetAddcontInfoList;
+    sceAppContentGetEntitlementKey;
+    sceAppContentGetRegion;
+    sceAppContentInitialize;
+    sceAppContentRequestPatchInstall;
+    sceAppContentSmallSharedDataFormat;
+    sceAppContentSmallSharedDataGetAvailableSpaceKb;
+    sceAppContentSmallSharedDataMount;
+    sceAppContentSmallSharedDataUnmount;
+    sceAppContentTemporaryDataFormat;
+    sceAppContentTemporaryDataGetAvailableSpaceKb;
+    sceAppContentTemporaryDataMount;
+    sceAppContentTemporaryDataMount2;
+    sceAppContentTemporaryDataUnmount;
+};
+
+libSceAppContentUtil:libSceAppContentBundle {
+  global:
+    sceAppContentCheckBundleLicenseOnDisc;
+};
+
+libSceAppContentUtil:libSceAppContentIro {
+  global:
+    sceAppContentAddcontEnqueueDownloadByEntitlemetId;
+    sceAppContentAddcontMountByEntitlemetId;
+    sceAppContentGetAddcontInfoByEntitlementId;
+    sceAppContentGetAddcontInfoListByIroTag;
+};
+
+libSceAppContentUtil:libSceAppContentPft {
+  global:
+    sceAppContentGetPftFlag;
+};
+
+libSceAppContentUtil:libSceAppContentSc {
+  global:
+    sceAppContentGetDownloadedStoreCountry;
+};
