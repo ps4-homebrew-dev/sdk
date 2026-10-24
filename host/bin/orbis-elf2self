@@ -736,7 +736,7 @@ class SignedElfFile(object):
 # is described by the stub X.so (or a file named exactly like the soname),
 # looked up in the -L directories, the input file's directory and the SDK.
 # The module is needed as X.prx.  A stub may give each of its symbols a version
-# "<module>:<library>", naming the module and the library the system exports
+# "<module>/<library>", naming the module and the library the system exports
 # it from, which need not be X: libSceAppContent.sprx is the module
 # libSceAppContentUtil, for instance, with the library libSceAppContent.
 # Without versions, the module X is imported as X, from one library also
@@ -882,7 +882,7 @@ def stub_exports(soname, stub_dirs):
     """The symbols the stub for `soname' defines, each with its version
     (None if unversioned).  The stub is a linker-readable ELF shared object
     named like the soname (libz.so.6), or X.so for X.sprx, as the SDK's stubs
-    are.  The SDK's stubs give each symbol a version "<module>:<library>",
+    are.  The SDK's stubs give each symbol a version "<module>/<library>",
     naming the module and library the system exports it from (see
     stubs/genstub.py)."""
     filenames = list(dict.fromkeys([soname, soname.rsplit(".", 1)[0] + ".so"]))
@@ -957,7 +957,7 @@ Module = namedtuple("Module", "index file name exports")
 def stub_module(soname, stub_dirs):
     """The file, module name and exports of the stub for `soname'.  Without
     versions, the module and its one library are named after the file, X;
-    with them, each symbol's version "<module>:<library>" names both."""
+    with them, each symbol's version "<module>/<library>" names both."""
     file = soname.split(".", 1)[0]
     exports = {}
     names = set()
@@ -967,9 +967,9 @@ def stub_module(soname, stub_dirs):
             exports[sym] = file
             unversioned.append(sym)
             continue
-        if version.count(":") != 1 or "" in version.split(":"):
-            die(f"{soname}: {sym}: version {version} is not <module>:<library>")
-        name, exports[sym] = version.split(":")
+        if version.count("/") != 1 or "" in version.split("/"):
+            die(f"{soname}: {sym}: version {version} is not <module>/<library>")
+        name, exports[sym] = version.split("/")
         names.add(name)
     if len(names) > 1:
         die(f"{soname}: the stub's versions name several modules: {', '.join(sorted(names))}")

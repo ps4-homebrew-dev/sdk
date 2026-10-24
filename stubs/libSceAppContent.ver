@@ -1,4 +1,4 @@
-libSceAppContentUtil:libSceAppContent {
+libSceAppContentUtil/libSceAppContent {
   global:
     _Z5dummyv;
     sceAppContentAddcontDelete;
@@ -33,12 +33,12 @@ libSceAppContentUtil:libSceAppContent {
     sceAppContentTemporaryDataUnmount;
 };
 
-libSceAppContentUtil:libSceAppContentBundle {
+libSceAppContentUtil/libSceAppContentBundle {
   global:
     sceAppContentCheckBundleLicenseOnDisc;
 };
 
-libSceAppContentUtil:libSceAppContentIro {
+libSceAppContentUtil/libSceAppContentIro {
   global:
     sceAppContentAddcontEnqueueDownloadByEntitlemetId;
     sceAppContentAddcontMountByEntitlemetId;
@@ -46,12 +46,12 @@ libSceAppContentUtil:libSceAppContentIro {
     sceAppContentGetAddcontInfoListByIroTag;
 };
 
-libSceAppContentUtil:libSceAppContentPft {
+libSceAppContentUtil/libSceAppContentPft {
   global:
     sceAppContentGetPftFlag;
 };
 
-libSceAppContentUtil:libSceAppContentSc {
+libSceAppContentUtil/libSceAppContentSc {
   global:
     sceAppContentGetDownloadedStoreCountry;
 };

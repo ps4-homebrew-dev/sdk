@@ -76,7 +76,7 @@ def read_cstr(f, offset):
 def symbols(sym_type, filename):
     '''
     yield (name, version) of the symbols in dynamic segments, named using the
-    NID lookup table 'aerolib.csv'.  The version is "<module>:<library>": the
+    NID lookup table 'aerolib.csv'.  The version is "<module>/<library>": the
     name of the module, from DT_SCE_MODULE_INFO, and that of the library that
     exports the symbol, from DT_SCE_EXPORT_LIB.  These often differ from the
     file name.
@@ -161,7 +161,7 @@ def symbols(sym_type, filename):
             version = None
             lib = libs.get(decode_id(lid))
             if module and lib:
-                version = module + ':' + lib
+                version = module + '/' + lib
 
             yield nid_map[nid], version
 
@@ -179,7 +179,7 @@ def versioned(syms):
     result = {}
     for name, versions in candidates.items():
         versions = sorted(v for v in versions if v)
-        preferred = [v for v in versions if v.split(':')[0] == v.split(':')[1]]
+        preferred = [v for v in versions if v.split('/')[0] == v.split('/')[1]]
         result[name] = (preferred or versions or [None])[0]
     return result
 
@@ -188,7 +188,9 @@ def version_script(syms):
     '''
     a version script for ld.lld that gives each symbol its version.
     orbis-elf2self reads the versions back from the stub to name the module
-    and library each symbol is imported from.
+    and library each symbol is imported from.  The separator is '/': ':' ends
+    a name in a version node since LLVM 22 (as in GNU ld), and PS4 module and
+    library names use '_', '.' and '-'.
     '''
     nodes = {}
     for name, version in sorted(syms.items()):
