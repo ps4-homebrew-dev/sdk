@@ -44,7 +44,7 @@ struct mmsghdr {
 	ssize_t		msg_len;		/* message length */
 };
 
-__attribute__((weak)) long __syscall(long n, ...);
+long __syscall(long n, ...);
 
 
 static ssize_t

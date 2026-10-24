@@ -55,7 +55,7 @@ struct mmsghdr {
 int ppoll(struct pollfd *, nfds_t, const struct timespec *, const sigset_t *);
 //#include "libc_private.h"
 
-__attribute__((weak)) long __syscall(long n, ...);
+long __syscall(long n, ...);
 
 
 static ssize_t
