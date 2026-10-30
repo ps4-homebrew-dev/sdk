@@ -223,7 +223,7 @@ _init_env_xdg(void) {
     setenv("XDG_STATE_HOME", "/user/temp/common_temp/.state", 0);
     mkdir("/user/temp/common_temp/.state", 0755);
 
-  } else if(!sceAppContentInitialize || !sceAppContentTemporaryDataMount2) {
+  } else if(1) {// !sceAppContentInitialize || !sceAppContentTemporaryDataMount2) {
     sprintf(path, "/%s/common_temp/.cache", sceKernelGetFsSandboxRandomWord());
     setenv("XDG_CACHE_HOME", path, 0);
     mkdir(path, 0755);
