@@ -14,7 +14,6 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
-
 #include "rtld.h"
 
 
@@ -126,11 +125,33 @@ extern void (*__fini_array_end[])(void) __attribute__((weak));
 
 
 /**
+ * Dependencies provided by libkernel.sprx
+ **/
+extern int sceKernelIsInSandbox(void);
+const char* sceKernelGetFsSandboxRandomWord(void);
+
+
+/**
  * Dependencies provided by libSceLibcInternal.sprx
  **/
 extern void _init_env(void*);
 extern int atexit(void (*fn)(void));
 extern void exit(int status);
+extern int setenv(const char *name, const char *value, int overwrite);
+extern int mkdir(const char *path, unsigned int mode);
+
+
+/**
+ * Dependencies provided by libSceSysmodule.sprx
+ **/
+extern int sceSysmoduleLoadModule(unsigned short);
+
+
+/**
+ * Optional dependencies provided by libSceAppContent.sprx
+ **/
+extern int sceAppContentInitialize(const void*, void*) __attribute__((weak));
+extern int sceAppContentTemporaryDataMount2(unsigned int, void*) __attribute__((weak));
 
 
 /**
@@ -180,6 +201,66 @@ _fini(void) {
 
 
 /**
+ * Initialize a few of XDG environment variables.
+ **/
+static void
+_init_env_xdg(void) {
+  char param[0x40] = {0};
+  char mount[0x10] = {0};
+  char boot[0x40] = {0};
+  char path[100] = {0};
+
+  if(!sceKernelIsInSandbox()) {
+    setenv("XDG_CACHE_HOME", "/user/temp/common_temp/.cache", 0);
+    mkdir("/user/temp/common_temp/.cache", 0755);
+
+    setenv("XDG_CONFIG_HOME", "/user/temp/common_temp/.config", 0);
+    mkdir("/user/temp/common_temp/.config", 0755);
+
+    setenv("XDG_DATA_HOME", "/user/temp/common_temp/.data", 0);
+    mkdir("/user/temp/common_temp/.data", 0755);
+
+    setenv("XDG_STATE_HOME", "/user/temp/common_temp/.state", 0);
+    mkdir("/user/temp/common_temp/.state", 0755);
+
+  } else if(!sceAppContentInitialize || !sceAppContentTemporaryDataMount2) {
+    sprintf(path, "/%s/common_temp/.cache", sceKernelGetFsSandboxRandomWord());
+    setenv("XDG_CACHE_HOME", path, 0);
+    mkdir(path, 0755);
+
+    sprintf(path, "/%s/common_temp/.config", sceKernelGetFsSandboxRandomWord());
+    setenv("XDG_CONFIG_HOME", path, 0);
+    mkdir(path, 0755);
+
+    sprintf(path, "/%s/common_temp/.data", sceKernelGetFsSandboxRandomWord());
+    setenv("XDG_DATA_HOME", path, 0);
+    mkdir(path, 0755);
+
+    sprintf(path, "/%s/common_temp/.state", sceKernelGetFsSandboxRandomWord());
+    setenv("XDG_STATE_HOME", path, 0);
+    mkdir(path, 0755);
+
+  } else {
+    sceSysmoduleLoadModule(0x00b4);
+    sceAppContentInitialize(param, boot);
+    sceAppContentTemporaryDataMount2(0, mount);
+
+    setenv("XDG_CACHE_HOME", "/temp0/.cache", 0);
+    mkdir("/temp0/.cache", 0755);
+
+    setenv("XDG_CONFIG_HOME", "/temp0/.config", 0);
+    mkdir("/temp0/.config", 0755);
+
+    setenv("XDG_DATA_HOME", "/temp0/.data", 0);
+    mkdir("/temp0/.data", 0755);
+
+    setenv("XDG_STATE_HOME", "/temp0/.state", 0);
+    mkdir("/temp0/.state", 0755);
+  }
+}
+
+
+/**
  * Entry point to the homebrew ELF image.
  **/
 __attribute__((noreturn, used, force_align_arg_pointer, no_stack_protector)) void
@@ -194,6 +275,7 @@ _start(long *ap, void (*cleanup)(void)) {
   atexit(_fini);
 
   _init_env(ap);
+  _init_env_xdg();
   _init();
 
   if(!exit_code) {
