@@ -95,3 +95,91 @@ function(orbis_add_self target)
   set_property(TARGET ${target} APPEND PROPERTY ADDITIONAL_CLEAN_FILES ${out})
 endfunction()
 
+function(orbis_add_pkg target)
+  cmake_parse_arguments(PARSE_ARGV 1 ARG ""
+    "TITLE;TITLE_ID;CONTENT_ID;VERSION;CATEGORY;APP_TYPE;ATTRIBUTE;SYSTEM_VER;DOWNLOAD_DATA_SIZE"
+    "ASSETS;MODULES")
+
+  if(ARG_UNPARSED_ARGUMENTS)
+    message(FATAL_ERROR "orbis_add_pkg: unknown arguments: ${ARG_UNPARSED_ARGUMENTS}")
+  endif()
+  if(NOT ARG_TITLE OR NOT ARG_TITLE_ID)
+    message(FATAL_ERROR "orbis_add_pkg: TITLE and TITLE_ID are required")
+  endif()
+  foreach(default VERSION=1.00 CATEGORY=gd APP_TYPE=1 ATTRIBUTE=2
+                  SYSTEM_VER=0 DOWNLOAD_DATA_SIZE=0)
+    string(REPLACE "=" ";" default ${default})
+    list(GET default 0 key)
+    if(NOT DEFINED ARG_${key})
+      list(GET default 1 ARG_${key})
+    endif()
+  endforeach()
+  if(NOT ARG_CONTENT_ID)
+    string(TOUPPER "${ARG_TITLE}0000000000000000" label)
+    string(REGEX REPLACE "[^A-Z0-9]" "" label "${label}")
+    string(SUBSTRING "${label}" 0 16 label)
+    set(ARG_CONTENT_ID "IV0000-${ARG_TITLE_ID}_00-${label}")
+  endif()
+
+  set(app0 ${CMAKE_CURRENT_BINARY_DIR}/${target}_app0)
+  set(pkg ${CMAKE_CURRENT_BINARY_DIR}/${ARG_CONTENT_ID}.pkg)
+  set(files eboot.bin sce_sys/param.sfo)
+
+  add_custom_command(OUTPUT ${app0}/eboot.bin
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${app0}
+    COMMAND ${ELF2SELF} $<TARGET_FILE:${target}> ${app0}/eboot.bin
+    DEPENDS ${target} VERBATIM)
+
+  add_custom_command(OUTPUT ${app0}/sce_sys/param.sfo
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${app0}/sce_sys
+    COMMAND ${MKSFO} -i APP_TYPE=${ARG_APP_TYPE}
+                     -i ATTRIBUTE=${ARG_ATTRIBUTE}
+                     -i SYSTEM_VER=${ARG_SYSTEM_VER}
+                     -i DOWNLOAD_DATA_SIZE=${ARG_DOWNLOAD_DATA_SIZE}
+                     -s4 CATEGORY=${ARG_CATEGORY}
+                     -s128 TITLE=${ARG_TITLE}
+                     -s12 TITLE_ID=${ARG_TITLE_ID}
+                     -s48 CONTENT_ID=${ARG_CONTENT_ID}
+                     -s8 APP_VER=${ARG_VERSION}
+                     -s8 VERSION=${ARG_VERSION}
+                     ${app0}/sce_sys/param.sfo
+    VERBATIM)
+
+  foreach(module ${ARG_MODULES})
+    get_filename_component(src ${module} ABSOLUTE
+                           BASE_DIR ${CMAKE_SYSROOT}/usr/lib)
+    get_filename_component(name ${src} NAME)
+    add_custom_command(OUTPUT ${app0}/sce_module/${name}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${app0}/sce_module
+      COMMAND ${ELF2SELF} ${src} ${app0}/sce_module/${name}
+      DEPENDS ${src} VERBATIM)
+    list(APPEND files sce_module/${name})
+  endforeach()
+
+  foreach(asset ${ARG_ASSETS})
+    get_filename_component(asset ${asset} ABSOLUTE)
+    if(IS_DIRECTORY ${asset})
+      file(GLOB_RECURSE srcs CONFIGURE_DEPENDS ${asset}/*)
+      # Skip hidden files and editor backups.
+      list(FILTER srcs EXCLUDE REGEX "/\\.[^/]*$|~$")
+      list(SORT srcs)
+    else()
+      set(srcs ${asset})
+    endif()
+    foreach(src ${srcs})
+      file(RELATIVE_PATH dst ${CMAKE_CURRENT_SOURCE_DIR} ${src})
+      add_custom_command(OUTPUT ${app0}/${dst}
+        COMMAND ${CMAKE_COMMAND} -E copy ${src} ${app0}/${dst}
+        DEPENDS ${src} VERBATIM)
+      list(APPEND files ${dst})
+    endforeach()
+  endforeach()
+
+  list(TRANSFORM files PREPEND ${app0}/ OUTPUT_VARIABLE deps)
+  add_custom_command(OUTPUT ${pkg}
+    COMMAND ${MKGP4} -c ${ARG_CONTENT_ID} -o ${target}.gp4 ${files}
+    COMMAND ${MKPKG} -o ${pkg} ${target}.gp4
+    WORKING_DIRECTORY ${app0}
+    DEPENDS ${deps} VERBATIM)
+  add_custom_target(${target}_pkg ALL DEPENDS ${pkg})
+endfunction()
