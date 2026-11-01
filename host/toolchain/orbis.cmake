@@ -77,3 +77,20 @@ set(ELF2SELF ${PS4_HOMEBREW_SDK}/bin/orbis-elf2self CACHE PATH "")
 set(MKSFO ${PS4_HOMEBREW_SDK}/bin/orbis-mksfo CACHE PATH "")
 set(MKGP4 ${PS4_HOMEBREW_SDK}/bin/orbis-mkgp4 CACHE PATH "")
 set(MKPKG ${PS4_HOMEBREW_SDK}/bin/orbis-mkpkg CACHE PATH "")
+
+function(orbis_add_self target)
+  if(ARGC GREATER 2)
+    message(FATAL_ERROR "orbis_add_self: unknown arguments: ${ARGN}")
+  endif()
+  set(out "$<TARGET_FILE_NAME:${target}>.self")
+  if(ARGC EQUAL 2)
+    set(out "${ARGV1}")
+  endif()
+  if(NOT IS_ABSOLUTE "${out}")
+    set(out "$<TARGET_FILE_DIR:${target}>/${out}")
+  endif()
+  add_custom_command(TARGET ${target} POST_BUILD
+    COMMAND ${ELF2SELF} $<TARGET_FILE:${target}> ${out}
+    VERBATIM)
+endfunction()
+
