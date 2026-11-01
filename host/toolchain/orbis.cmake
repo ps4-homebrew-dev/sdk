@@ -92,5 +92,6 @@ function(orbis_add_self target)
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND ${ELF2SELF} $<TARGET_FILE:${target}> ${out}
     VERBATIM)
+  set_property(TARGET ${target} APPEND PROPERTY ADDITIONAL_CLEAN_FILES ${out})
 endfunction()
 
