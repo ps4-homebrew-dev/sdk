@@ -44,6 +44,13 @@ typedef struct __ucontext {
 	 * note: the union is not defined, though.
 	 */
 	sigset_t	uc_sigmask;
+#ifdef __SCE__
+	/*
+	 * The PS4 kernel has 48 more bytes here than FreeBSD 9 does, so
+	 * uc_mcontext starts at offset 64, not 16.
+	 */
+	int		__spare_sce__[12];
+#endif
 	mcontext_t	uc_mcontext;
 
 	struct __ucontext *uc_link;

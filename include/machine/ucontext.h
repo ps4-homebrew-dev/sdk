@@ -86,10 +86,27 @@ typedef struct __mcontext {
 #define	_MC_FPOWNED_FPU		0x20001	/* FP state came from FPU */
 #define	_MC_FPOWNED_PCB		0x20002	/* FP state came from PCB */
 	long	mc_ownedfp;
+#ifdef __SCE__
+	/*
+	 * The PS4 kernel has four more fields here than FreeBSD 9.
+	 */
+	__register_t	mc_lbrfrom;	/* IP of the last taken branch */
+	__register_t	mc_lbrto;	/* target IP of that branch */
+	__register_t	mc_hwexc;	/* x86 exception vector | (error << 8) */
+	__register_t	mc_hwaddr;	/* fault address on #PF, 1 on #BP */
+	/*
+	 * See <machine/fpu.h> for the internals of mc_fpstate[]. The PS4
+	 * kernel saves an XSAVE area with the AVX state here: 832 bytes,
+	 * not FreeBSD 9's 512-byte FXSAVE area. That makes mcontext_t
+	 * 1152 bytes, which is what the kernel puts in mc_len.
+	 */
+	long	mc_fpstate[104] __aligned(16);
+#else
 	/*
 	 * See <machine/fpu.h> for the internals of mc_fpstate[].
 	 */
 	long	mc_fpstate[64] __aligned(16);
+#endif
 
 	__register_t	mc_fsbase;
 	__register_t	mc_gsbase;
