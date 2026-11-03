@@ -60,6 +60,37 @@ typedef struct __ucontext {
 	int		__spare__[4];
 } ucontext_t;
 
+#ifdef __SCE__
+/*
+ * The PS4 kernel's layout, verified on hardware. A wrong offset here
+ * corrupts every signal handler and context switch, so fail the build.
+ */
+_Static_assert(sizeof(mcontext_t) == 1152, "PS4 mcontext_t size");
+_Static_assert(__offsetof(mcontext_t, mc_len) == 200, "PS4 mc_len");
+_Static_assert(__offsetof(mcontext_t, mc_lbrfrom) == 224, "PS4 mc_lbrfrom");
+_Static_assert(__offsetof(mcontext_t, mc_fpstate) == 256, "PS4 mc_fpstate");
+_Static_assert(__offsetof(mcontext_t, mc_fsbase) == 1088, "PS4 mc_fsbase");
+_Static_assert(__offsetof(ucontext_t, uc_mcontext) == 64,
+    "PS4 uc_mcontext");
+#if __BSD_VISIBLE
+/* struct sigcontext overlays the start of ucontext_t. */
+_Static_assert(__offsetof(struct sigcontext, sc_onstack) ==
+    __offsetof(ucontext_t, uc_mcontext), "PS4 sc_onstack");
+_Static_assert(__offsetof(struct sigcontext, sc_len) ==
+    __offsetof(ucontext_t, uc_mcontext) + __offsetof(mcontext_t, mc_len),
+    "PS4 sc_len");
+_Static_assert(__offsetof(struct sigcontext, sc_lbrfrom) ==
+    __offsetof(ucontext_t, uc_mcontext) +
+    __offsetof(mcontext_t, mc_lbrfrom), "PS4 sc_lbrfrom");
+_Static_assert(__offsetof(struct sigcontext, sc_fpstate) ==
+    __offsetof(ucontext_t, uc_mcontext) +
+    __offsetof(mcontext_t, mc_fpstate), "PS4 sc_fpstate");
+_Static_assert(sizeof(struct sigcontext) ==
+    __offsetof(ucontext_t, uc_mcontext) + sizeof(mcontext_t),
+    "PS4 sigcontext size");
+#endif
+#endif
+
 #if defined(_KERNEL) && defined(COMPAT_FREEBSD4)
 #if defined(__i386__)
 struct ucontext4 {

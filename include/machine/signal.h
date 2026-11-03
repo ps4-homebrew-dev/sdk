@@ -58,6 +58,9 @@ typedef long sig_atomic_t;
  */
 struct sigcontext {
 	struct __sigset sc_mask;	/* signal mask to restore */
+#ifdef __SCE__
+	int	__spare_sce__[12];	/* see __spare_sce__ in ucontext_t */
+#endif
 	long	sc_onstack;		/* sigstack state to restore */
 	long	sc_rdi;		/* machine state (struct trapframe) */
 	long	sc_rsi;
@@ -94,7 +97,15 @@ struct sigcontext {
 	 */
 	long	sc_fpformat;
 	long	sc_ownedfp;
+#ifdef __SCE__
+	long	sc_lbrfrom;		/* see mc_lbrfrom in mcontext_t */
+	long	sc_lbrto;
+	long	sc_hwexc;
+	long	sc_hwaddr;
+	long	sc_fpstate[104] __aligned(16);
+#else
 	long	sc_fpstate[64] __aligned(16);
+#endif
 
 	long	sc_fsbase;
 	long	sc_gsbase;
