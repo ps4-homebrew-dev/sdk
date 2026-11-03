@@ -450,9 +450,15 @@ int	 truncate(const char *, __off_t);
 int	__srget(FILE *);
 int	__swbuf(int, FILE *);
 
+#ifndef __SCE__
 /*
  * The __sfoo macros are here so that we can
  * define function versions in the C library.
+ *
+ * Sony's libc has its own FILE layout, which does not match struct
+ * __sFILE above, so these macros would read the wrong fields there.
+ * With __SCE__, getc(), putc(), fileno() and the rest are plain calls
+ * into Sony's libc instead.
  */
 #define	__sgetc(p) (--(p)->_r < 0 ? __srget(p) : (int)(*(p)->_p++))
 #if defined(__GNUC__) && defined(__STDC__)
@@ -475,10 +481,11 @@ static __inline int __sputc(int _c, FILE *_p) {
 			__swbuf((int)(c), p) : \
 		(*(p)->_p = (c), (int)*(p)->_p++))
 #endif
+#endif /* !__SCE__ */
 
 extern int __isthreaded;
 
-#ifndef __cplusplus
+#if !defined(__cplusplus) && !defined(__SCE__)
 
 #define	__sfeof(p)	(((p)->_flags & __SEOF) != 0)
 #define	__sferror(p)	(((p)->_flags & __SERR) != 0)
@@ -517,7 +524,7 @@ extern int __isthreaded;
 #define	getchar_unlocked()	getc_unlocked(stdin)
 #define	putchar_unlocked(x)	putc_unlocked(x, stdout)
 #endif
-#endif /* __cplusplus */
+#endif /* !__cplusplus && !__SCE__ */
 
 __END_DECLS
 #endif /* !_STDIO_H_ */
