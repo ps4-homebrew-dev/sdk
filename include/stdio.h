@@ -343,10 +343,14 @@ char	*tempnam(const char *, const char *);
 #endif
 
 #if __BSD_VISIBLE || __POSIX_VISIBLE >= 200809
+#ifndef __SCE__
 FILE	*fmemopen(void * __restrict, size_t, const char * __restrict);
+#endif
 ssize_t	 getdelim(char ** __restrict, size_t * __restrict, int,
 	    FILE * __restrict);
+#ifndef __SCE__
 FILE	*open_memstream(char **, size_t *);
+#endif
 int	 renameat(int, const char *, int, const char *);
 int	 vdprintf(int, const char * __restrict, __va_list);
 
@@ -412,6 +416,7 @@ int	 vasprintf(char **, const char *, __va_list)
 extern __const int sys_nerr;
 extern __const char *__const sys_errlist[];
 
+#ifndef __SCE__
 /*
  * Stdio function-access interface.
  */
@@ -422,6 +427,7 @@ FILE	*funopen(const void *,
 	    int (*)(void *));
 #define	fropen(cookie, fn) funopen(cookie, fn, 0, 0, 0)
 #define	fwopen(cookie, fn) funopen(cookie, 0, fn, 0, 0)
+#endif /* !__SCE__ */
 
 /*
  * Portability hacks.  See <sys/types.h>.
