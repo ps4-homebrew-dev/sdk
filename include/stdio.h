@@ -40,7 +40,16 @@
 #include <sys/_null.h>
 #include <sys/_types.h>
 
+#ifdef __SCE__
+typedef struct {
+	__int64_t	_Off;
+	unsigned long	_Wchar;
+	unsigned short	_Byte;
+	unsigned short	_State;
+} fpos_t;
+#else
 typedef	__off_t		fpos_t;
+#endif
 
 #ifndef _SIZE_T_DECLARED
 typedef	__size_t	size_t;
