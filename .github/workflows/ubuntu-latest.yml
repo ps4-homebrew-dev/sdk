@@ -4,11 +4,9 @@ on:
   push:
     paths-ignore:
       - "**/*.md"
-      - '**/*.txt'
   pull_request:
     paths-ignore:
       - "**/*.md"
-      - '**/*.txt'
   workflow_dispatch:
 
 jobs:
@@ -27,9 +25,6 @@ jobs:
     - name: Build SDK
       run: |
         make install
-        cd ${{ runner.tool_cache }}
-        zip -r $GITHUB_WORKSPACE/ps4-homebrew-sdk.zip ps4-homebrew-sdk
-        cd -
       env:
         DESTDIR: ${{ runner.tool_cache }}/ps4-homebrew-sdk
         PS4_HOMEBREW_SDK: ${{ runner.tool_cache }}/ps4-homebrew-sdk
