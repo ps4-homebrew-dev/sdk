@@ -512,9 +512,24 @@ getaddrinfo(const char *hostname, const char *servname,
   }
 
   if(servname) {
-    port = atoi(servname);
-    if(port <= 0 || port > 65535) {
-      return EAI_SERVICE;
+    char *endptr = 0;
+    long val = strtol(servname, &endptr, 10);
+
+    if(*servname && !*endptr) {
+      if(val < 0 || val > 65535) {
+        return EAI_SERVICE;
+      }
+      port = (int)val;
+    } else {
+      struct servent se;
+      struct servent *res_se = 0;
+      char sbuf[128];
+      const char *proto = (info_tmpl.ai_socktype == SOCK_DGRAM) ? "udp" : "tcp";
+
+      if(getservbyname_r(servname, proto, &se, sbuf, sizeof sbuf, &res_se) || !res_se) {
+        return EAI_SERVICE;
+      }
+      port = ntohs(res_se->s_port);
     }
   }
 
@@ -534,6 +549,12 @@ getaddrinfo(const char *hostname, const char *servname,
     }
     else if(resolve_ntoa(hostname, &ip_addr)) {
       return EAI_FAIL;
+    }
+  } else {
+    if(info_tmpl.ai_flags & AI_PASSIVE) {
+      ip_addr = htonl(INADDR_ANY);
+    } else {
+      ip_addr = htonl(INADDR_LOOPBACK);
     }
   }
 
@@ -558,7 +579,7 @@ getaddrinfo(const char *hostname, const char *servname,
   info->ai_canonname = NULL;
   info->ai_next = NULL;
 
-  if(info_tmpl.ai_flags & AI_CANONNAME) {
+  if(hostname && (info_tmpl.ai_flags & AI_CANONNAME)) {
     info->ai_canonname = strdup(hostname); //TODO: CNAMEs
   }
 
@@ -586,11 +607,80 @@ freeaddrinfo(struct addrinfo *res) {
 }
 
 
+static const struct {
+  const char *name;
+  int port;
+  const char *proto;
+} g_services[] = {
+  {"ftp",    21,  "tcp"},
+  {"ssh",    22,  "tcp"},
+  {"telnet", 23,  "tcp"},
+  {"http",   80,  "tcp"},
+  {"https",  443, "tcp"},
+  {0, 0, 0}
+};
+
+
 int
 getservbyname_r(const char *name, const char *prots, struct servent *se,
                 char *buf, size_t buflen, struct servent **res) {
-#warning "getservbyname_r() not implemented"
-  return -1;
+  size_t namelen, protolen, needed, pad;
+  char **aliases;
+  int idx = -1;
+
+  if(!name || !se || !buf || !res) {
+    return EINVAL;
+  }
+  *res = 0;
+
+  for(int i=0; g_services[i].name; i++) {
+    if(!strcasecmp(g_services[i].name, name)) {
+      if(!prots || !strcasecmp(g_services[i].proto, prots)) {
+        idx = i;
+        break;
+      }
+    }
+  }
+
+  if(idx < 0) {
+    return ENOENT;
+  }
+
+  pad = (uintptr_t)buf & (sizeof(char *) - 1);
+  if(pad) {
+    pad = sizeof(char *) - pad;
+    if(buflen < pad) {
+      return ERANGE;
+    }
+    buf += pad;
+    buflen -= pad;
+  }
+
+  namelen = strlen(g_services[idx].name) + 1;
+  protolen = strlen(g_services[idx].proto) + 1;
+  needed = 2 * sizeof(char *) + namelen + protolen;
+  if(buflen < needed) {
+    return ERANGE;
+  }
+
+  aliases = (char **)buf;
+  buf += 2 * sizeof(char *);
+  buflen -= 2 * sizeof(char *);
+
+  se->s_name = buf;
+  memcpy(buf, g_services[idx].name, namelen);
+  buf += namelen;
+
+  se->s_proto = buf;
+  memcpy(buf, g_services[idx].proto, protolen);
+
+  aliases[0] = se->s_name;
+  aliases[1] = 0;
+  se->s_aliases = aliases;
+  se->s_port = htons(g_services[idx].port);
+
+  *res = se;
+  return 0;
 }
 
 
@@ -665,7 +755,7 @@ getservbyport_r(int port, const char *prots, struct servent *se, char *buf,
 struct servent*
 getservbyname(const char *name, const char *prots) {
   static struct servent se;
-  static char *buf[2];
+  static long buf[64 / sizeof(long)];
   struct servent *res;
 
   if(getservbyname_r(name, prots, &se, (void *)buf, sizeof buf, &res)) {
